@@ -13,5 +13,12 @@ coverage.html
 
 vendor/
 
+# Local Phase 1 dependency/cache artifacts.
+.stage1-cache/
+.stage1-spike/
+
+# Local notes may contain credentials; never stage them.
+/这是一个伟大的开始.txt
+
 data/*
 !data/README.md
