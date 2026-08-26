@@ -17,6 +17,10 @@ vendor/
 .stage1-cache/
 .stage1-spike/
 
+# Local Phase 1.5 compatibility spike/cache artifacts.
+.stage15-cache/
+.stage15-spike/
+
 # Local notes may contain credentials; never stage them.
 /这是一个伟大的开始.txt
 

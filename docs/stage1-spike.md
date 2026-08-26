@@ -9,7 +9,7 @@
 | `trpc.group/trpc-go/trpc-agent-go v1.11.2` | module path、Go 1.21 声明、Runner/OpenAI/Session/Memory API 已编译并在真实调用链使用 |
 | `github.com/go-telegram/bot v1.23.0` | 临时模块编译通过；保留为 Telegram 首选 SDK，不写入生产 `go.mod` |
 | `github.com/silenceper/wechat/v2 v2.1.14` | 临时模块编译通过；应用消息发送可复用，内部应用普通回调需平台薄适配 |
-| `github.com/redis/go-redis/v9 v9.7.0` | 用于 Phase 1 Redis 客户端和健康检查 |
+| `github.com/redis/go-redis/v9 v9.7.0` | Phase 1 快照适配器使用的历史版本；Phase 1.5 已随官方子模块升级到 `v9.11.0` |
 
 ## 模型与 Redis
 
@@ -21,17 +21,19 @@
 - 默认 Codex 沙箱不能访问 Docker 配置与 named pipe；宿主执行正常，该差异不属于 Windows 或 Docker 故障。
 - 真实 Redis Smoke Test 已完成：Mock OpenAI-compatible 模型、真实 Runner、Redis Session 写入和回复链路通过。
 
-## 框架 Redis 能力差异
+## 框架 Redis 能力差异（Phase 1 当时结论，Phase 1.5 已纠正）
 
-`v1.11.2` 发布模块中没有 `session/redis`、`memory/redis` 或 `storage/redis` 包。README 对 Redis Session/Memory 的描述不能直接转化为该版本的 import。
+Phase 1 当时只检查了根模块 `trpc-agent-go@v1.11.2` 的下载目录，因此误写为远程没有 Redis 包。准确事实是：根模块目录不包含这些包，但同一多模块仓库已独立发布 `session/redis`、`memory/redis`、`storage/redis v1.11.0`。Phase 1.5 已在隔离消费者中验证它们可与根模块 `v1.11.2`、Go 1.21.13 和 Runner 一起使用，完整证据见 `docs/stage1.5-storage-spike.md`。
 
-Phase 1 采用平台薄适配：
+Phase 1 当时采用平台自研快照适配器：
 
 - 以框架 `session.Service` 和 `memory.Service` 为接口契约。
 - Redis 保存 Session/Event 和 Memory 的 JSON 快照，禁止故障时回退 InMemory。
 - 已验证 Session 跨 runtime 可见、Memory 跨实例可见。
 - 当前只承诺 Phase 1 使用到的 Session 创建/读取/事件追加/Session State 和 Memory CRUD/关键词搜索。
 - App/User State、Summary 持久化、ListSessions、分页、跨进程原子更新和生产迁移语义留到共享后端阶段完善。
+
+Phase 1.5 已选择“官方 Redis Service + 平台生命周期薄包装”，删除上述快照适配器和 `ErrUnsupported`；历史段落仅用于解释 Phase 1 的完成边界，不再描述当前生产运行时。
 
 ## Telegram 覆盖矩阵
 
@@ -83,4 +85,4 @@ ClassifyWeComError(httpStatus, errCode, err)
 - 两种 IM 只完成 API/边界 Spike，正式 Adapter 后置。
 - `message_id` 不提供 Inbox 幂等。
 - 当前单进程 `executor` 不是后续独立 Worker 进程。
-- Redis 快照适配不是完整生产后端，不宣称已解决跨进程并发写一致性。
+- Phase 1 的 Redis 快照适配不是完整生产后端；它已在 Phase 1.5 被官方 Redis Service 替换。

@@ -51,7 +51,7 @@ func TestRuntimeRealRedisSmoke(t *testing.T) {
 		t.Fatalf("reply = %q", reply.Text)
 	}
 	memoryKey := memory.UserKey{AppName: cfg.AppName, UserID: "smoke-user"}
-	if err := first.memoryStore.AddMemory(context.Background(), memoryKey, "real redis memory", []string{"smoke"}); err != nil {
+	if err := first.backend.Memory().AddMemory(context.Background(), memoryKey, "real redis memory", []string{"smoke"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := first.Close(); err != nil {
@@ -63,7 +63,10 @@ func TestRuntimeRealRedisSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	sess, err := second.sessionStore.GetSession(context.Background(), session.Key{
+	if err := second.Ready(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	sess, err := second.backend.Session().GetSession(context.Background(), session.Key{
 		AppName:   cfg.AppName,
 		UserID:    identity.RunnerUserID(cfg.IdentitySecret, cfg.BindingID, "smoke-user"),
 		SessionID: identity.SessionID(cfg.IdentitySecret, cfg.BindingID, "smoke-conversation"),
@@ -74,7 +77,7 @@ func TestRuntimeRealRedisSmoke(t *testing.T) {
 	if sess == nil || len(sess.Events) == 0 {
 		t.Fatalf("expected session events from real Redis, got %#v", sess)
 	}
-	memories, err := second.memoryStore.SearchMemories(context.Background(), memoryKey, "redis")
+	memories, err := second.backend.Memory().SearchMemories(context.Background(), memoryKey, "redis")
 	if err != nil {
 		t.Fatal(err)
 	}

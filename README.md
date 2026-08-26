@@ -98,12 +98,14 @@
 | --- | --- | --- |
 | Agent 编排 | `agent/llmagent`、`agent/graph`、Chain / Parallel / Cycle | 租户级 Agent 注册、发布与路由 |
 | 执行入口 | `runner.Runner`（流式 Event、context 取消） | 多租户 Worker 调度、无状态水平扩展 |
-| Session / Memory / Artifact / Knowledge | `session`、`memory`、`artifact`、`knowledge` 及多后端实现 | 租户级后端选择、数据隔离与迁移 |
+| Session / Memory / Artifact / Knowledge | 根模块接口，以及独立发布的 `session/redis v1.11.0`、`memory/redis v1.11.0`、`storage/redis v1.11.0` 等后端子模块；Redis 方案已由 Phase 1.5 B 路径验证 | 租户级后端选择、`RedisBackend` 延迟初始化、命名空间、生命周期与迁移 |
 | Tool / MCP / Skill | `tool`、MCP Tool、`skill` | 租户工具白名单与密钥注入 |
 | 治理 | Plugin / Guardrail / Callbacks | 租户策略下发、预算与审批 |
 | 服务化 | `server/openai`、`server/agui`、`server/a2a`、`server/trpcagent` | 统一 Gateway、Admin API |
 | IM 接入 | OpenClaw Gateway + Channel | 微信 / 企业微信等通道与租户绑定 |
 | 可观测性 | OpenTelemetry tracing / metrics | 租户维度审计、成本与合规 |
+
+当前实现已完成 Phase 1.5 存储验证：生产运行时采用官方 Redis Session/Memory Service，并由平台 `RedisBackend` 统一处理延迟初始化、`/readyz` 恢复、`<REDIS_KEY_PREFIX>:official-v1` 命名空间、工具禁用和关闭顺序。根模块保持 `v1.11.2`，Redis 子模块为 `v1.11.0`，`go-redis` 为 `v9.11.0`；SQL 子模块只在隔离 Spike 中验证，不进入生产依赖。详见 [`docs/stage1.5-storage-spike.md`](docs/stage1.5-storage-spike.md)。
 
 ## 代码目录
 

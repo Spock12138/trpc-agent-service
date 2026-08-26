@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	openaioption "github.com/openai/openai-go/option"
-	"github.com/redis/go-redis/v9"
 	frameworkagent "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -52,38 +51,36 @@ type Reply struct {
 }
 
 type Runtime struct {
-	config       config.Config
-	redisClient  *redis.Client
-	sessionStore *storage.RedisSessionService
-	memoryStore  *storage.RedisMemoryService
-	cache        *agent.RunnerCache
-	closeOnce    sync.Once
-	closeErr     error
+	config    config.Config
+	backend   *storage.RedisBackend
+	cache     *agent.RunnerCache
+	lifecycle sync.RWMutex
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func New(cfg config.Config) (*Runtime, error) {
-	redisOptions, err := redis.ParseURL(cfg.RedisURL)
+	backend, err := storage.NewRedisBackend(cfg.RedisURL, cfg.RedisKeyPrefix)
 	if err != nil {
-		return nil, fmt.Errorf("parse redis url: %w", err)
-	}
-	client := redis.NewClient(redisOptions)
-	sessionStore := storage.NewRedisSessionService(client, cfg.RedisKeyPrefix)
-	memoryStore := storage.NewRedisMemoryService(client, cfg.RedisKeyPrefix)
-
-	var runtime *Runtime
-	cache, err := agent.NewRunnerCache(agent.DefaultCacheConfig(), func(ctx context.Context, key agent.CacheKey) (frameworkrunner.Runner, error) {
-		return newRunner(ctx, cfg, key, sessionStore, memoryStore)
-	})
-	if err != nil {
-		_ = client.Close()
 		return nil, err
 	}
-	runtime = &Runtime{
-		config:       cfg,
-		redisClient:  client,
-		sessionStore: sessionStore,
-		memoryStore:  memoryStore,
-		cache:        cache,
+
+	cache, err := agent.NewRunnerCache(agent.DefaultCacheConfig(), func(ctx context.Context, key agent.CacheKey) (frameworkrunner.Runner, error) {
+		sessions := backend.Session()
+		memories := backend.Memory()
+		if sessions == nil || memories == nil {
+			return nil, fmt.Errorf("redis backend is not ready")
+		}
+		return newRunner(ctx, cfg, key, sessions, memories)
+	})
+	if err != nil {
+		_ = backend.Close()
+		return nil, err
+	}
+	runtime := &Runtime{
+		config:  cfg,
+		backend: backend,
+		cache:   cache,
 	}
 	return runtime, nil
 }
@@ -101,23 +98,35 @@ func newRunner(_ context.Context, cfg config.Config, key agent.CacheKey, session
 }
 
 func (r *Runtime) Ready(ctx context.Context) error {
+	r.lifecycle.RLock()
+	defer r.lifecycle.RUnlock()
+	return r.ready(ctx)
+}
+
+func (r *Runtime) ready(ctx context.Context) error {
+	if err := r.backend.Ready(ctx); err != nil {
+		return fmt.Errorf("redis backend: %w", err)
+	}
 	if err := r.cache.Ready(r.cacheKey()); err != nil {
 		return fmt.Errorf("runner cache: %w", err)
-	}
-	if err := r.redisClient.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("redis ping: %w", err)
 	}
 	return nil
 }
 
 func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
+	// Keep the backend alive for the whole request. Runtime.Close takes the
+	// write lock, so shutdown drains active Runner/session work before closing
+	// the borrowed official services.
+	r.lifecycle.RLock()
+	defer r.lifecycle.RUnlock()
+
 	if req.BindingID != r.config.BindingID {
 		return Reply{}, ErrUnknownBinding
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := r.Ready(ctx); err != nil {
+	if err := r.ready(ctx); err != nil {
 		return Reply{}, fmt.Errorf("%w: %v", ErrDependencyUnavailable, err)
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, r.config.ModelRequestTimeout)
@@ -151,12 +160,22 @@ func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
 		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 			return Reply{}, ErrAgentTimeout
 		}
+		if requestCtx.Err() == nil {
+			if checkErr := r.backend.Check(requestCtx); checkErr != nil {
+				return Reply{}, fmt.Errorf("%w: %v", ErrDependencyUnavailable, checkErr)
+			}
+		}
 		return Reply{}, fmt.Errorf("%w: %v", ErrAgentFailed, err)
 	}
 	text, eventErr := collectText(events)
 	if eventErr != nil {
 		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 			return Reply{}, ErrAgentTimeout
+		}
+		if requestCtx.Err() == nil {
+			if checkErr := r.backend.Check(requestCtx); checkErr != nil {
+				return Reply{}, fmt.Errorf("%w: %v", ErrDependencyUnavailable, checkErr)
+			}
 		}
 		return Reply{}, eventErr
 	}
@@ -202,8 +221,12 @@ func collectText(events <-chan *event.Event) (string, error) {
 }
 
 func (r *Runtime) Close() error {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
 	r.closeOnce.Do(func() {
-		r.closeErr = errors.Join(r.cache.Close(), r.sessionStore.Close(), r.memoryStore.Close(), r.redisClient.Close())
+		// RunnerCache owns runners; the backend owns the borrowed official
+		// services and closes them only after all runners have stopped.
+		r.closeErr = errors.Join(r.cache.Close(), r.backend.Close())
 	})
 	return r.closeErr
 }
@@ -228,6 +251,5 @@ func buildAgent(cfg config.Config) frameworkagent.Agent {
 	)
 }
 
-// compile-time checks document the framework contracts used by this runtime.
-var _ session.Service = (*storage.RedisSessionService)(nil)
-var _ memory.Service = (*storage.RedisMemoryService)(nil)
+// The backend exposes the framework session.Service and memory.Service
+// contracts; concrete checks live alongside the official adapters in storage.

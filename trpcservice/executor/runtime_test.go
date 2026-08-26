@@ -16,12 +16,12 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
-	"github.com/redis/go-redis/v9"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
+	memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 )
 
 func TestRuntimeUsesRedisBackedSessionAcrossRuntimeInstances(t *testing.T) {
@@ -97,7 +97,7 @@ func TestRuntimeUsesRedisBackedSessionAcrossRuntimeInstances(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := sessionKeyForTest(cfg)
-	sess, err := second.sessionStore.GetSession(context.Background(), key)
+	sess, err := second.backend.Session().GetSession(context.Background(), key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,6 +238,52 @@ func TestRuntimeRedisFailureDoesNotFallback(t *testing.T) {
 	}
 }
 
+func TestRuntimeCloseDrainsActiveHandle(t *testing.T) {
+	redisServer := miniredis.RunT(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"mock","object":"chat.completion","created":1,"model":"mock","choices":[{"index":0,"message":{"role":"assistant","content":"drained"},"finish_reason":"stop"}]}`))
+	}))
+	defer modelServer.Close()
+	cfg := testRuntimeConfig("redis://"+redisServer.Addr()+"/0", modelServer.URL, "close-drain")
+	runtime, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	requestDone := make(chan error, 1)
+	go func() {
+		_, requestErr := runtime.Handle(context.Background(), Request{
+			BindingID: cfg.BindingID, MessageID: "m", ExternalUserID: "u", ConversationID: "c",
+			Text: "hello", RequestID: "request", TraceID: "trace",
+		})
+		requestDone <- requestErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("model request did not start")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- runtime.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned while Handle was active: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-requestDone; err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
 type closeCountingSession struct {
 	session.Service
 	closes atomic.Int32
@@ -259,12 +305,9 @@ func (m *closeCountingMemory) Close() error {
 }
 
 func TestRunnerDoesNotCloseSharedServices(t *testing.T) {
-	redisServer := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
-	defer client.Close()
-	sessions := &closeCountingSession{Service: storage.NewRedisSessionService(client, "ownership-test")}
-	memories := &closeCountingMemory{Service: storage.NewRedisMemoryService(client, "ownership-test")}
-	cfg := testRuntimeConfig("redis://"+redisServer.Addr()+"/0", "https://example.test", "ownership-test")
+	sessions := &closeCountingSession{Service: sessioninmemory.NewSessionService()}
+	memories := &closeCountingMemory{Service: memoryinmemory.NewMemoryService()}
+	cfg := testRuntimeConfig("redis://127.0.0.1:6379/0", "https://example.test", "ownership-test")
 	runner, err := newRunner(context.Background(), cfg, agentCacheKey(cfg), sessions, memories)
 	if err != nil {
 		t.Fatal(err)
