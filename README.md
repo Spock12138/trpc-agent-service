@@ -105,7 +105,7 @@
 | IM 接入 | OpenClaw Gateway + Channel | 微信 / 企业微信等通道与租户绑定 |
 | 可观测性 | OpenTelemetry tracing / metrics | 租户维度审计、成本与合规 |
 
-当前实现已完成 Phase 1.5 存储验证：生产运行时采用官方 Redis Session/Memory Service，并由平台 `RedisBackend` 统一处理延迟初始化、`/readyz` 恢复、`<REDIS_KEY_PREFIX>:official-v1` 命名空间、工具禁用和关闭顺序。根模块保持 `v1.11.2`，Redis 子模块为 `v1.11.0`，`go-redis` 为 `v9.11.0`；SQL 子模块只在隔离 Spike 中验证，不进入生产依赖。详见 [`docs/stage1.5-storage-spike.md`](docs/stage1.5-storage-spike.md)。
+当前实现已完成 Phase 2 多租户内核：只读 JSON Catalog 和 `PresetRepository` 管理 Tenant、AgentApp、ChannelBinding、ConfigVersion 与 StorageProfile；服务端通过可信 Binding 派生租户和活动配置，`BackendProvider` 按租户选择官方 InMemory/Redis Session/Memory，`RunnerRegistry` 按 `tenant_id + agent_app_id + config_version` 缓存 Runner。原 Demo HTTP 与环境变量入口保持兼容，Redis 不可用时不回退其他后端。详见 [`docs/stage2-multi-tenant.md`](docs/stage2-multi-tenant.md)。Phase 1.5 的官方 Redis 选择与 SQL Spike 证据仍见 [`docs/stage1.5-storage-spike.md`](docs/stage1.5-storage-spike.md)。
 
 ## 代码目录
 
@@ -148,6 +148,20 @@ cd trpc-agent-service
 ./build.sh
 ./start.sh
 ```
+
+需要修改监听地址时使用 `./start.sh -addr :8081`；脚本会将参数传给 `trpc-service serve`。
+
+Phase 2 也可以通过 `PLATFORM_CONFIG_FILE` 加载只读多租户目录。示例文件为 `configs/phase2.example.json`；先按实际环境修改模型 endpoint，并通过环境变量提供引用的凭据：
+
+```bash
+export IDENTITY_SECRET='replace-with-at-least-32-random-bytes'
+export PLATFORM_CONFIG_FILE='configs/phase2.example.json'
+export PHASE2_MODEL_KEY='replace-with-model-key'
+export PHASE2_REDIS_URL='redis://localhost:6379/0'
+./start.sh
+```
+
+目录文件只允许 `env:<ENV_NAME>` 凭据引用，不得写入模型 Key 或 Redis URL 明文。未设置 `PLATFORM_CONFIG_FILE` 时继续使用原有单租户环境变量契约。
 
 停止服务：
 
