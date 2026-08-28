@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
@@ -93,6 +94,7 @@ func messageHandler(backend Backend) http.HandlerFunc {
 		}
 
 		reply, err := backend.Handle(r.Context(), executor.Request{
+			Channel:        "demo",
 			BindingID:      input.BindingID,
 			MessageID:      input.MessageID,
 			ExternalUserID: input.ExternalUserID,
@@ -100,6 +102,7 @@ func messageHandler(backend Backend) http.HandlerFunc {
 			Text:           input.Text,
 			RequestID:      requestID,
 			TraceID:        traceID,
+			ReceivedAt:     time.Now().UTC(),
 		})
 		if err != nil {
 			writeMappedError(w, err, requestID, traceID)
@@ -137,7 +140,7 @@ func writeMappedError(w http.ResponseWriter, err error, requestID, traceID strin
 	switch {
 	case errors.Is(err, executor.ErrUnknownBinding):
 		status, code, message = http.StatusNotFound, "binding_not_found", "binding not found"
-	case errors.Is(err, executor.ErrRunnerDraining), errors.Is(err, executor.ErrDependencyUnavailable):
+	case errors.Is(err, executor.ErrRunnerDraining), errors.Is(err, executor.ErrConfigurationUnavailable), errors.Is(err, executor.ErrDependencyUnavailable):
 		status, code, message = http.StatusServiceUnavailable, "not_ready", "service dependency unavailable"
 	case errors.Is(err, executor.ErrAgentTimeout):
 		status, code, message = http.StatusGatewayTimeout, "model_timeout", "model request timed out"

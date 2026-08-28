@@ -97,7 +97,11 @@ func TestRuntimeUsesRedisBackedSessionAcrossRuntimeInstances(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := sessionKeyForTest(cfg)
-	sess, err := second.backend.Session().GetSession(context.Background(), key)
+	backend, err := second.backendForBinding(context.Background(), "demo", cfg.BindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := backend.Session().GetSession(context.Background(), key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +312,16 @@ func TestRunnerDoesNotCloseSharedServices(t *testing.T) {
 	sessions := &closeCountingSession{Service: sessioninmemory.NewSessionService()}
 	memories := &closeCountingMemory{Service: memoryinmemory.NewMemoryService()}
 	cfg := testRuntimeConfig("redis://127.0.0.1:6379/0", "https://example.test", "ownership-test")
-	runner, err := newRunner(context.Background(), cfg, agentCacheKey(cfg), sessions, memories)
+	catalog, credentials, err := cfg.RuntimeCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	configVersion := catalog.ConfigVersions[0]
+	apiKey, err := credentials.Resolve(configVersion.Model.CredentialRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, err := newRunner(context.Background(), agentCacheKey(cfg), configVersion, apiKey, sessions, memories)
 	if err != nil {
 		t.Fatal(err)
 	}

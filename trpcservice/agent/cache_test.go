@@ -197,6 +197,44 @@ func TestRunnerCacheCountsPendingCreationsAgainstCapacity(t *testing.T) {
 	lease.Release()
 }
 
+func TestRunnerCacheEvictsLeastRecentlyUsedIdleEntry(t *testing.T) {
+	config := DefaultCacheConfig()
+	config.MaxEntries = 2
+	created := make(map[CacheKey]*fakeRunner)
+	cache, err := NewRunnerCache(config, func(_ context.Context, key CacheKey) (frameworkrunner.Runner, error) {
+		runner := &fakeRunner{}
+		created[key] = runner
+		return runner, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+
+	oldest, err := cache.Acquire(context.Background(), testKey("v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldest.Release()
+	time.Sleep(time.Millisecond)
+	newer, err := cache.Acquire(context.Background(), testKey("v2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer.Release()
+	third, err := cache.Acquire(context.Background(), testKey("v3"))
+	if err != nil {
+		t.Fatalf("Acquire(v3) error = %v", err)
+	}
+	third.Release()
+	if got := created[testKey("v1")].closeCount.Load(); got != 1 {
+		t.Fatalf("least recently used runner closed %d times, want 1", got)
+	}
+	if got := created[testKey("v2")].closeCount.Load(); got != 0 {
+		t.Fatalf("newer runner closed %d times, want 0", got)
+	}
+}
+
 func TestRunnerCacheCreationTimeoutClosesLateRunner(t *testing.T) {
 	config := DefaultCacheConfig()
 	config.CreateTimeout = 10 * time.Millisecond

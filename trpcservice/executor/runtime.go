@@ -1,4 +1,4 @@
-// Package executor implements the single-process phase 1 runtime.
+// Package executor implements the single-process multi-tenant Agent runtime.
 package executor
 
 import (
@@ -21,77 +21,81 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
+	platformmessage "github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
 var (
-	ErrUnknownBinding        = errors.New("unknown binding")
-	ErrDependencyUnavailable = errors.New("runtime dependency unavailable")
-	ErrRunnerDraining        = errors.New("runner is draining")
-	ErrAgentTimeout          = errors.New("agent request timed out")
-	ErrAgentFailed           = errors.New("agent request failed")
-	ErrEmptyAgentResponse    = errors.New("agent returned an empty response")
+	ErrUnknownBinding           = errors.New("unknown binding")
+	ErrConfigurationUnavailable = errors.New("runtime configuration unavailable")
+	ErrDependencyUnavailable    = errors.New("runtime dependency unavailable")
+	ErrRunnerDraining           = errors.New("runner is draining")
+	ErrAgentTimeout             = errors.New("agent request timed out")
+	ErrAgentFailed              = errors.New("agent request failed")
+	ErrEmptyAgentResponse       = errors.New("agent returned an empty response")
 )
 
-type Request struct {
-	BindingID      string
-	MessageID      string
-	ExternalUserID string
-	ConversationID string
-	Text           string
-	RequestID      string
-	TraceID        string
-}
-
-type Reply struct {
-	RequestID string `json:"request_id"`
-	TraceID   string `json:"trace_id"`
-	SessionID string `json:"session_id"`
-	Text      string `json:"text"`
-}
+type Request = platformmessage.InboundMessage
+type Reply = platformmessage.OutboundMessage
 
 type Runtime struct {
-	config    config.Config
-	backend   *storage.RedisBackend
-	cache     *agent.RunnerCache
+	identitySecret []byte
+	repository     tenant.Repository
+	backends       *storage.BackendProvider
+	registry       *agent.RunnerRegistry
+
 	lifecycle sync.RWMutex
 	closeOnce sync.Once
 	closeErr  error
 }
 
 func New(cfg config.Config) (*Runtime, error) {
-	backend, err := storage.NewRedisBackend(cfg.RedisURL, cfg.RedisKeyPrefix)
+	catalog, credentials, err := cfg.RuntimeCatalog()
 	if err != nil {
 		return nil, err
 	}
-
-	cache, err := agent.NewRunnerCache(agent.DefaultCacheConfig(), func(ctx context.Context, key agent.CacheKey) (frameworkrunner.Runner, error) {
-		sessions := backend.Session()
-		memories := backend.Memory()
-		if sessions == nil || memories == nil {
-			return nil, fmt.Errorf("redis backend is not ready")
-		}
-		return newRunner(ctx, cfg, key, sessions, memories)
-	})
+	repository, err := tenant.NewPresetRepository(catalog)
 	if err != nil {
-		_ = backend.Close()
+		return nil, fmt.Errorf("create tenant repository: %w", err)
+	}
+	backends, err := storage.NewBackendProvider(repository, credentials)
+	if err != nil {
 		return nil, err
 	}
-	runtime := &Runtime{
-		config:  cfg,
-		backend: backend,
-		cache:   cache,
+	registry, err := agent.NewRunnerRegistry(
+		repository,
+		backends,
+		credentials,
+		agent.DefaultCacheConfig(),
+		newRunner,
+	)
+	if err != nil {
+		_ = backends.Close()
+		return nil, err
 	}
-	return runtime, nil
+	return &Runtime{
+		identitySecret: append([]byte(nil), cfg.IdentitySecret...),
+		repository:     repository,
+		backends:       backends,
+		registry:       registry,
+	}, nil
 }
 
-func newRunner(_ context.Context, cfg config.Config, key agent.CacheKey, sessions session.Service, memories memory.Service) (frameworkrunner.Runner, error) {
-	if key.TenantID != cfg.TenantID || key.AgentAppID != cfg.AgentAppID || key.ConfigVersion != cfg.ConfigVersion {
-		return nil, fmt.Errorf("unsupported runner key")
+func newRunner(
+	_ context.Context,
+	key agent.CacheKey,
+	configVersion tenant.ConfigVersion,
+	apiKey string,
+	sessions session.Service,
+	memories memory.Service,
+) (frameworkrunner.Runner, error) {
+	if key.TenantID != configVersion.TenantID || key.AgentAppID != configVersion.AgentAppID || key.ConfigVersion != configVersion.Version {
+		return nil, errors.New("runner configuration does not match cache key")
 	}
 	return frameworkrunner.NewRunner(
-		cfg.AppName,
-		buildAgent(cfg),
+		tenant.AppName(key.TenantID, key.AgentAppID),
+		buildAgent(configVersion, apiKey),
 		frameworkrunner.WithSessionService(sessions),
 		frameworkrunner.WithMemoryService(memories),
 	), nil
@@ -100,55 +104,87 @@ func newRunner(_ context.Context, cfg config.Config, key agent.CacheKey, session
 func (r *Runtime) Ready(ctx context.Context) error {
 	r.lifecycle.RLock()
 	defer r.lifecycle.RUnlock()
-	return r.ready(ctx)
-}
-
-func (r *Runtime) ready(ctx context.Context) error {
-	if err := r.backend.Ready(ctx); err != nil {
-		return fmt.Errorf("redis backend: %w", err)
-	}
-	if err := r.cache.Ready(r.cacheKey()); err != nil {
-		return fmt.Errorf("runner cache: %w", err)
+	if err := r.registry.Ready(ctx); err != nil {
+		return fmt.Errorf("runtime not ready: %w", err)
 	}
 	return nil
 }
 
+func (r *Runtime) backendForBinding(ctx context.Context, channel, bindingID string) (storage.Backend, error) {
+	binding, err := r.repository.ResolveBinding(ctx, channel, bindingID)
+	if err != nil {
+		return nil, err
+	}
+	app, err := r.repository.GetAgentApp(ctx, binding.TenantID, binding.AgentAppID)
+	if err != nil {
+		return nil, err
+	}
+	configVersion, err := r.repository.GetConfigVersion(ctx, binding.TenantID, binding.AgentAppID, app.ActiveConfigVersion)
+	if err != nil {
+		return nil, err
+	}
+	profile, err := r.repository.GetStorageProfile(ctx, binding.TenantID, configVersion.StorageProfileID)
+	if err != nil {
+		return nil, err
+	}
+	return r.backends.BackendFor(ctx, profile)
+}
+
 func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
-	// Keep the backend alive for the whole request. Runtime.Close takes the
-	// write lock, so shutdown drains active Runner/session work before closing
-	// the borrowed official services.
+	// Runtime.Close takes the write lock, so active Runner and backend work is
+	// drained before the registry and borrowed services are closed.
 	r.lifecycle.RLock()
 	defer r.lifecycle.RUnlock()
-
-	if req.BindingID != r.config.BindingID {
-		return Reply{}, ErrUnknownBinding
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := r.ready(ctx); err != nil {
-		return Reply{}, fmt.Errorf("%w: %v", ErrDependencyUnavailable, err)
+	channel := req.Channel
+	if channel == "" {
+		channel = "demo"
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, r.config.ModelRequestTimeout)
-	defer cancel()
-	key := r.cacheKey()
-	lease, err := r.cache.Acquire(requestCtx, key)
+	binding, err := r.repository.ResolveBinding(ctx, channel, req.BindingID)
 	if err != nil {
-		if errors.Is(err, agent.ErrRunnerDrain) {
+		if errors.Is(err, tenant.ErrBindingNotFound) {
+			return Reply{}, ErrUnknownBinding
+		}
+		return Reply{}, fmt.Errorf("%w: binding lookup failed", ErrConfigurationUnavailable)
+	}
+	if _, err := r.repository.GetTenant(ctx, binding.TenantID); err != nil {
+		return Reply{}, fmt.Errorf("%w: tenant lookup failed", ErrConfigurationUnavailable)
+	}
+	app, err := r.repository.GetAgentApp(ctx, binding.TenantID, binding.AgentAppID)
+	if err != nil {
+		return Reply{}, fmt.Errorf("%w: agent app lookup failed", ErrConfigurationUnavailable)
+	}
+	configVersion, err := r.repository.GetConfigVersion(ctx, binding.TenantID, binding.AgentAppID, app.ActiveConfigVersion)
+	if err != nil {
+		return Reply{}, fmt.Errorf("%w: active config lookup failed", ErrConfigurationUnavailable)
+	}
+
+	requestCtx, cancel := context.WithTimeout(ctx, configVersion.Model.RequestTimeout)
+	defer cancel()
+	key := agent.CacheKey{
+		TenantID: binding.TenantID, AgentAppID: binding.AgentAppID, ConfigVersion: app.ActiveConfigVersion,
+	}
+	lease, err := r.registry.Acquire(requestCtx, key)
+	if err != nil {
+		switch {
+		case errors.Is(err, agent.ErrRunnerDrain):
 			return Reply{}, ErrRunnerDraining
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
+		case errors.Is(err, context.DeadlineExceeded):
 			return Reply{}, ErrAgentTimeout
+		case errors.Is(err, agent.ErrRegistryConfiguration):
+			return Reply{}, fmt.Errorf("%w: runner configuration unavailable", ErrConfigurationUnavailable)
+		case errors.Is(err, agent.ErrRegistryDependency), errors.Is(err, agent.ErrCacheClosed), errors.Is(err, agent.ErrCacheFull):
+			return Reply{}, fmt.Errorf("%w: runner dependency unavailable", ErrDependencyUnavailable)
+		default:
+			return Reply{}, fmt.Errorf("acquire runner: %w", err)
 		}
-		if errors.Is(err, agent.ErrCacheClosed) || errors.Is(err, agent.ErrCacheFull) {
-			return Reply{}, fmt.Errorf("%w: runner cache unavailable", ErrDependencyUnavailable)
-		}
-		return Reply{}, fmt.Errorf("acquire runner: %w", err)
 	}
 	defer lease.Release()
 
-	userID := identity.RunnerUserID(r.config.IdentitySecret, req.BindingID, req.ExternalUserID)
-	sessionID := identity.SessionID(r.config.IdentitySecret, req.BindingID, req.ConversationID)
+	userID := identity.RunnerUserID(r.identitySecret, binding.ID, req.ExternalUserID)
+	sessionID := identity.SessionID(r.identitySecret, binding.ID, req.ConversationID)
 	events, err := lease.Runner.Run(
 		requestCtx,
 		userID,
@@ -161,8 +197,8 @@ func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
 			return Reply{}, ErrAgentTimeout
 		}
 		if requestCtx.Err() == nil {
-			if checkErr := r.backend.Check(requestCtx); checkErr != nil {
-				return Reply{}, fmt.Errorf("%w: %v", ErrDependencyUnavailable, checkErr)
+			if checkErr := lease.Backend.Check(requestCtx); checkErr != nil {
+				return Reply{}, fmt.Errorf("%w: selected storage unavailable", ErrDependencyUnavailable)
 			}
 		}
 		return Reply{}, fmt.Errorf("%w: %v", ErrAgentFailed, err)
@@ -173,19 +209,16 @@ func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
 			return Reply{}, ErrAgentTimeout
 		}
 		if requestCtx.Err() == nil {
-			if checkErr := r.backend.Check(requestCtx); checkErr != nil {
-				return Reply{}, fmt.Errorf("%w: %v", ErrDependencyUnavailable, checkErr)
+			if checkErr := lease.Backend.Check(requestCtx); checkErr != nil {
+				return Reply{}, fmt.Errorf("%w: selected storage unavailable", ErrDependencyUnavailable)
 			}
 		}
 		return Reply{}, eventErr
 	}
-	return Reply{RequestID: req.RequestID, TraceID: req.TraceID, SessionID: sessionID, Text: text}, nil
-}
-
-func (r *Runtime) cacheKey() agent.CacheKey {
-	return agent.CacheKey{
-		TenantID: r.config.TenantID, AgentAppID: r.config.AgentAppID, ConfigVersion: r.config.ConfigVersion,
-	}
+	return Reply{
+		Channel: channel, BindingID: binding.ID, RequestID: req.RequestID,
+		TraceID: req.TraceID, SessionID: sessionID, Text: text,
+	}, nil
 }
 
 func collectText(events <-chan *event.Event) (string, error) {
@@ -224,32 +257,31 @@ func (r *Runtime) Close() error {
 	r.lifecycle.Lock()
 	defer r.lifecycle.Unlock()
 	r.closeOnce.Do(func() {
-		// RunnerCache owns runners; the backend owns the borrowed official
-		// services and closes them only after all runners have stopped.
-		r.closeErr = errors.Join(r.cache.Close(), r.backend.Close())
+		// Runners borrow Session/Memory services from the provider. Close all
+		// runners before closing the provider-owned services.
+		r.closeErr = errors.Join(r.registry.Close(), r.backends.Close())
 	})
 	return r.closeErr
 }
 
-func newOpenAIModel(cfg config.Config) *openai.Model {
+func newOpenAIModel(configVersion tenant.ConfigVersion, apiKey string) *openai.Model {
 	return openai.New(
-		cfg.ModelName,
-		openai.WithBaseURL(cfg.ModelBaseURL),
-		openai.WithAPIKey(cfg.ModelAPIKey),
+		configVersion.Model.Name,
+		openai.WithBaseURL(configVersion.Model.BaseURL),
+		openai.WithAPIKey(apiKey),
 		openai.WithOpenAIOptions(openaioption.WithMaxRetries(0)),
 	)
 }
 
-func buildAgent(cfg config.Config) frameworkagent.Agent {
-	maxTokens := cfg.ModelMaxOutput
+func buildAgent(configVersion tenant.ConfigVersion, apiKey string) frameworkagent.Agent {
+	maxTokens := configVersion.Model.MaxOutputTokens
 	temperature := 0.2
 	return llmagent.New(
-		"assistant",
-		llmagent.WithModel(newOpenAIModel(cfg)),
-		llmagent.WithInstruction("You are a concise assistant. Answer the user's request directly."),
-		llmagent.WithGenerationConfig(model.GenerationConfig{MaxTokens: &maxTokens, Temperature: &temperature, Stream: false}),
+		configVersion.AgentAppID,
+		llmagent.WithModel(newOpenAIModel(configVersion, apiKey)),
+		llmagent.WithInstruction(configVersion.Instruction),
+		llmagent.WithGenerationConfig(model.GenerationConfig{
+			MaxTokens: &maxTokens, Temperature: &temperature, Stream: false,
+		}),
 	)
 }
-
-// The backend exposes the framework session.Service and memory.Service
-// contracts; concrete checks live alongside the official adapters in storage.

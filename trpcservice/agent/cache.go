@@ -156,9 +156,13 @@ func (c *RunnerCache) Acquire(ctx context.Context, key CacheKey) (*Lease, error)
 
 		victims := c.evictExpiredLocked(time.Now())
 		if len(c.entries)+len(c.creating) >= c.config.MaxEntries {
-			c.mu.Unlock()
-			c.closeEntries(victims)
-			return nil, ErrCacheFull
+			if victim := c.evictLRULocked(); victim != nil {
+				victims = append(victims, victim)
+			} else {
+				c.mu.Unlock()
+				c.closeEntries(victims)
+				return nil, ErrCacheFull
+			}
 		}
 		pending := &creation{done: make(chan struct{})}
 		c.creating[key] = pending
@@ -201,7 +205,23 @@ func (c *RunnerCache) Acquire(ctx context.Context, key CacheKey) (*Lease, error)
 	}
 }
 
-// Ready reports whether the fixed-key Phase 1 runtime may accept new runs.
+func (c *RunnerCache) evictLRULocked() *cacheEntry {
+	var victim *cacheEntry
+	for _, entry := range c.entries {
+		if entry.refs != 0 || entry.draining {
+			continue
+		}
+		if victim == nil || entry.lastUsed.Before(victim.lastUsed) {
+			victim = entry
+		}
+	}
+	if victim != nil {
+		delete(c.entries, victim.key)
+	}
+	return victim
+}
+
+// Ready reports whether a specific key may accept new runs.
 func (c *RunnerCache) Ready(key CacheKey) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -210,6 +230,15 @@ func (c *RunnerCache) Ready(key CacheKey) error {
 	}
 	if entry, ok := c.entries[key]; ok && entry.draining {
 		return ErrRunnerDrain
+	}
+	return nil
+}
+
+func (c *RunnerCache) Available() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrCacheClosed
 	}
 	return nil
 }

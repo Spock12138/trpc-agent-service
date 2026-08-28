@@ -27,7 +27,10 @@ func (f fakeBackend) Handle(ctx context.Context, req executor.Request) (executor
 
 func TestMessageHandlerSuccessAndIDs(t *testing.T) {
 	handler := NewHandler(fakeBackend{handle: func(_ context.Context, req executor.Request) (executor.Reply, error) {
-		return executor.Reply{RequestID: req.RequestID, TraceID: req.TraceID, SessionID: "s_test", Text: "ok"}, nil
+		if req.Channel != "demo" || req.ReceivedAt.IsZero() {
+			t.Fatalf("request was not converted to the internal message contract: %#v", req)
+		}
+		return executor.Reply{Channel: req.Channel, BindingID: req.BindingID, RequestID: req.RequestID, TraceID: req.TraceID, SessionID: "s_test", Text: "ok"}, nil
 	}})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/demo/messages", strings.NewReader(`{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`))
 	rec := httptest.NewRecorder()
@@ -41,6 +44,12 @@ func TestMessageHandlerSuccessAndIDs(t *testing.T) {
 	}
 	if len(body["request_id"]) != 16 || len(body["trace_id"]) != 32 {
 		t.Fatalf("unexpected IDs: %#v", body)
+	}
+	if _, exists := body["channel"]; exists {
+		t.Fatalf("internal channel leaked into HTTP response: %#v", body)
+	}
+	if _, exists := body["binding_id"]; exists {
+		t.Fatalf("internal binding leaked into HTTP response: %#v", body)
 	}
 }
 
@@ -61,6 +70,7 @@ func TestMessageHandlerValidationAndErrorMapping(t *testing.T) {
 		{name: "body too large", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"` + strings.Repeat("x", maxBodyBytes) + `"}`, status: http.StatusBadRequest},
 		{name: "unknown binding", input: `{"binding_id":"other","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrUnknownBinding, status: http.StatusNotFound},
 		{name: "dependency unavailable", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrDependencyUnavailable, status: http.StatusServiceUnavailable},
+		{name: "configuration unavailable", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrConfigurationUnavailable, status: http.StatusServiceUnavailable},
 		{name: "runner draining", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrRunnerDraining, status: http.StatusServiceUnavailable},
 		{name: "timeout", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrAgentTimeout, status: http.StatusGatewayTimeout},
 		{name: "failure", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrEmptyAgentResponse, status: http.StatusBadGateway},
