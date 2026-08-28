@@ -26,3 +26,6 @@ vendor/
 
 data/*
 !data/README.md
+
+# Local real-model smoke catalog; credentials remain in environment variables.
+/configs/phase2.smoke.json
