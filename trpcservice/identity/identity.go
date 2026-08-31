@@ -44,3 +44,11 @@ func RequestID() (string, error) {
 	}
 	return hex.EncodeToString(raw[:]), nil
 }
+
+func TaskID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "t_" + hex.EncodeToString(raw[:]), nil
+}

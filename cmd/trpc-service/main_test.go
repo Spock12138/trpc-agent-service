@@ -31,3 +31,21 @@ func TestParseServeArgs(t *testing.T) {
 		})
 	}
 }
+
+func TestParseGatewayAndWorkerArgs(t *testing.T) {
+	var output bytes.Buffer
+	addr, consumer, help, err := parseGatewayArgs([]string{"-addr", "127.0.0.1:9090", "-consumer", "gateway-fixed"}, &output)
+	if err != nil || help || addr != "127.0.0.1:9090" || consumer != "gateway-fixed" {
+		t.Fatalf("parseGatewayArgs() = (%q, %q, %v, %v)", addr, consumer, help, err)
+	}
+	healthAddr, consumer, help, err := parseWorkerArgs([]string{"-health-addr", "127.0.0.1:9091", "-consumer", "worker-fixed"}, &output)
+	if err != nil || help || healthAddr != "127.0.0.1:9091" || consumer != "worker-fixed" {
+		t.Fatalf("parseWorkerArgs() = (%q, %q, %v, %v)", healthAddr, consumer, help, err)
+	}
+	if _, _, _, err := parseGatewayArgs([]string{"extra"}, &output); err == nil {
+		t.Fatal("parseGatewayArgs() unexpectedly accepted a positional argument")
+	}
+	if _, _, _, err := parseWorkerArgs([]string{"extra"}, &output); err == nil {
+		t.Fatal("parseWorkerArgs() unexpectedly accepted a positional argument")
+	}
+}

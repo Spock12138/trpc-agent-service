@@ -145,6 +145,8 @@ func TestCollectTextStreamingEmptyAndErrorEvents(t *testing.T) {
 	close(failed)
 	if _, err := collectText(failed); !errors.Is(err, ErrAgentFailed) {
 		t.Fatalf("collectText(error) error = %v, want ErrAgentFailed", err)
+	} else if strings.Contains(err.Error(), "upstream-secret-detail") {
+		t.Fatalf("collectText leaked upstream error detail: %v", err)
 	}
 }
 

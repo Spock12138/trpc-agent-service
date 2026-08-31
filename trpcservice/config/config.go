@@ -71,6 +71,7 @@ type Config struct {
 	IdentitySecret []byte
 	Catalog        tenant.Catalog
 	CatalogPath    string
+	Messaging      *MessagingConfig
 
 	ModelName           string
 	ModelBaseURL        string
@@ -91,18 +92,18 @@ type Config struct {
 
 func (c Config) String() string {
 	return fmt.Sprintf(
-		"Config{CatalogPath:%q Tenants:%d AgentApps:%d ConfigVersions:%d StorageProfiles:%d ChannelBindings:%d ModelName:%q ModelBaseURL:%q ModelAPIKeyEnv:[REDACTED] ModelAPIKey:[REDACTED] ModelRequestTimeout:%s ModelMaxOutput:%d IdentitySecret:[REDACTED] RedisURL:%q RedisKeyPrefix:%q BindingID:%q TenantID:%q AgentAppID:%q ConfigVersion:%q AppName:%q}",
+		"Config{CatalogPath:%q Tenants:%d AgentApps:%d ConfigVersions:%d StorageProfiles:%d ChannelBindings:%d Messaging:%v ModelName:%q ModelBaseURL:%q ModelAPIKeyEnv:[REDACTED] ModelAPIKey:[REDACTED] ModelRequestTimeout:%s ModelMaxOutput:%d IdentitySecret:[REDACTED] RedisURL:[REDACTED] RedisKeyPrefix:%q BindingID:%q TenantID:%q AgentAppID:%q ConfigVersion:%q AppName:%q}",
 		c.CatalogPath,
 		len(c.Catalog.Tenants),
 		len(c.Catalog.AgentApps),
 		len(c.Catalog.ConfigVersions),
 		len(c.Catalog.StorageProfiles),
 		len(c.Catalog.ChannelBindings),
+		c.Messaging,
 		c.ModelName,
 		redactModelURL(c.ModelBaseURL),
 		c.ModelRequestTimeout,
 		c.ModelMaxOutput,
-		redactURLPassword(c.RedisURL),
 		c.RedisKeyPrefix,
 		c.BindingID,
 		c.TenantID,
@@ -141,6 +142,27 @@ func (c Config) RuntimeCatalog() (tenant.Catalog, CredentialResolver, error) {
 	return catalog, resolver, nil
 }
 
+// RoutingCatalog validates the immutable catalog without resolving model or
+// tenant storage credentials. Gateway uses it to avoid requiring Worker-only
+// secrets.
+func (c Config) RoutingCatalog() (tenant.Catalog, error) {
+	catalog := c.Catalog
+	if len(catalog.Tenants) == 0 {
+		var err error
+		catalog, _, err = legacyCatalog(c)
+		if err != nil {
+			return tenant.Catalog{}, err
+		}
+	}
+	if _, err := tenant.NewPresetRepository(catalog); err != nil {
+		return tenant.Catalog{}, fmt.Errorf("validate platform catalog: %w", err)
+	}
+	if err := validateCatalogModelURLs(catalog); err != nil {
+		return tenant.Catalog{}, err
+	}
+	return catalog, nil
+}
+
 func NewCatalogConfig(catalog tenant.Catalog, identitySecret []byte, resolver CredentialResolver) (Config, error) {
 	if len(identitySecret) < MinIdentitySecretLen {
 		return Config{}, fmt.Errorf("IDENTITY_SECRET must be at least %d bytes", MinIdentitySecretLen)
@@ -159,8 +181,17 @@ func NewCatalogConfig(catalog tenant.Catalog, identitySecret []byte, resolver Cr
 	return config, nil
 }
 
-// Load reads either PLATFORM_CONFIG_FILE or the Phase 1 environment contract.
+// Load preserves the existing all-in-one behavior.
 func Load() (Config, error) {
+	return LoadForRole(RoleServe)
+}
+
+// LoadForRole reads either PLATFORM_CONFIG_FILE or the Phase 1 environment
+// contract and resolves only the credentials required by the selected role.
+func LoadForRole(role Role) (Config, error) {
+	if role != RoleGateway && role != RoleWorker && role != RoleServe {
+		return Config{}, errors.New("unsupported service role")
+	}
 	identitySecret, err := requiredEnv("IDENTITY_SECRET")
 	if err != nil {
 		return Config{}, err
@@ -170,21 +201,34 @@ func Load() (Config, error) {
 	}
 
 	if path := strings.TrimSpace(os.Getenv("PLATFORM_CONFIG_FILE")); path != "" {
-		catalog, err := loadCatalogFile(path)
+		catalog, rawMessaging, err := loadPlatformFile(path)
 		if err != nil {
 			return Config{}, err
 		}
-		config, err := NewCatalogConfig(catalog, []byte(identitySecret), envCredentialResolver{})
+		config := Config{IdentitySecret: []byte(identitySecret), Catalog: catalog, credentials: envCredentialResolver{}}
+		if _, err := config.RoutingCatalog(); err != nil {
+			return Config{}, err
+		}
+		if role != RoleGateway {
+			if _, _, err := config.RuntimeCatalog(); err != nil {
+				return Config{}, err
+			}
+		}
+		messaging, err := parseMessagingFile(rawMessaging, config.credentials)
 		if err != nil {
 			return Config{}, err
 		}
+		if messaging == nil {
+			return Config{}, errors.New("platform messaging configuration is required")
+		}
+		config.Messaging = messaging
 		config.CatalogPath = path
 		return config, nil
 	}
-	return loadLegacy([]byte(identitySecret))
+	return loadLegacy([]byte(identitySecret), role)
 }
 
-func loadLegacy(identitySecret []byte) (Config, error) {
+func loadLegacy(identitySecret []byte, role Role) (Config, error) {
 	modelName, err := requiredEnv("MODEL_NAME")
 	if err != nil {
 		return Config{}, err
@@ -200,9 +244,12 @@ func loadLegacy(identitySecret []byte) (Config, error) {
 	if !validEnvName(keyEnv) {
 		return Config{}, errors.New("MODEL_API_KEY_ENV must name a valid environment variable")
 	}
-	apiKey := strings.TrimSpace(os.Getenv(keyEnv))
-	if apiKey == "" {
-		return Config{}, errors.New("model api key referenced by MODEL_API_KEY_ENV is missing")
+	apiKey := ""
+	if role != RoleGateway {
+		apiKey = strings.TrimSpace(os.Getenv(keyEnv))
+		if apiKey == "" {
+			return Config{}, errors.New("model api key referenced by MODEL_API_KEY_ENV is missing")
+		}
 	}
 	redisRaw, err := requiredEnv("REDIS_URL")
 	if err != nil {
@@ -243,20 +290,28 @@ func loadLegacy(identitySecret []byte) (Config, error) {
 		ConfigVersion:       "v1",
 		AppName:             tenant.AppName("tenant-demo", "assistant"),
 	}
+	messaging := legacyMessaging(redisURL, config.RedisKeyPrefix)
+	config.Messaging = &messaging
 	catalog, resolver, err := legacyCatalog(config)
 	if err != nil {
 		return Config{}, err
 	}
 	config.Catalog = catalog
 	config.credentials = resolver
-	if _, _, err := config.RuntimeCatalog(); err != nil {
-		return Config{}, err
+	if role == RoleGateway {
+		if _, err := config.RoutingCatalog(); err != nil {
+			return Config{}, err
+		}
+	} else {
+		if _, _, err := config.RuntimeCatalog(); err != nil {
+			return Config{}, err
+		}
 	}
 	return config, nil
 }
 
 func legacyCatalog(c Config) (tenant.Catalog, CredentialResolver, error) {
-	if strings.TrimSpace(c.ModelName) == "" || strings.TrimSpace(c.ModelBaseURL) == "" || strings.TrimSpace(c.ModelAPIKey) == "" || strings.TrimSpace(c.RedisURL) == "" {
+	if strings.TrimSpace(c.ModelName) == "" || strings.TrimSpace(c.ModelBaseURL) == "" || strings.TrimSpace(c.ModelAPIKeyEnv) == "" || strings.TrimSpace(c.RedisURL) == "" {
 		return tenant.Catalog{}, nil, errors.New("legacy runtime configuration is incomplete")
 	}
 	if len(c.IdentitySecret) < MinIdentitySecretLen {
@@ -302,6 +357,7 @@ func legacyCatalog(c Config) (tenant.Catalog, CredentialResolver, error) {
 
 type catalogFile struct {
 	SchemaVersion   int                     `json:"schema_version"`
+	Messaging       *messagingConfigFile    `json:"messaging,omitempty"`
 	Tenants         []tenant.Tenant         `json:"tenants"`
 	StorageProfiles []tenant.StorageProfile `json:"storage_profiles"`
 	AgentApps       []tenant.AgentApp       `json:"agent_apps"`
@@ -327,30 +383,35 @@ type modelConfigFile struct {
 }
 
 func loadCatalogFile(path string) (tenant.Catalog, error) {
+	catalog, _, err := loadPlatformFile(path)
+	return catalog, err
+}
+
+func loadPlatformFile(path string) (tenant.Catalog, *messagingConfigFile, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return tenant.Catalog{}, fmt.Errorf("open platform config: %w", err)
+		return tenant.Catalog{}, nil, fmt.Errorf("open platform config: %w", err)
 	}
 	defer file.Close()
 	data, err := io.ReadAll(io.LimitReader(file, MaxCatalogBytes+1))
 	if err != nil {
-		return tenant.Catalog{}, fmt.Errorf("read platform config: %w", err)
+		return tenant.Catalog{}, nil, fmt.Errorf("read platform config: %w", err)
 	}
 	if len(data) > MaxCatalogBytes {
-		return tenant.Catalog{}, fmt.Errorf("platform config exceeds %d bytes", MaxCatalogBytes)
+		return tenant.Catalog{}, nil, fmt.Errorf("platform config exceeds %d bytes", MaxCatalogBytes)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var raw catalogFile
 	if err := decoder.Decode(&raw); err != nil {
-		return tenant.Catalog{}, fmt.Errorf("decode platform config: %w", err)
+		return tenant.Catalog{}, nil, fmt.Errorf("decode platform config: %w", err)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
-		return tenant.Catalog{}, errors.New("platform config must contain one JSON object")
+		return tenant.Catalog{}, nil, errors.New("platform config must contain one JSON object")
 	}
 	if raw.SchemaVersion != CatalogSchemaVersion {
-		return tenant.Catalog{}, errors.New("unsupported platform config schema_version")
+		return tenant.Catalog{}, nil, errors.New("unsupported platform config schema_version")
 	}
 
 	catalog := tenant.Catalog{
@@ -363,10 +424,10 @@ func loadCatalogFile(path string) (tenant.Catalog, error) {
 	for _, current := range raw.ConfigVersions {
 		timeout, err := time.ParseDuration(strings.TrimSpace(current.Model.RequestTimeout))
 		if err != nil {
-			return tenant.Catalog{}, errors.New("platform config contains an invalid model request_timeout")
+			return tenant.Catalog{}, nil, errors.New("platform config contains an invalid model request_timeout")
 		}
 		if _, err := envNameFromCredentialRef(current.Model.CredentialRef); err != nil {
-			return tenant.Catalog{}, err
+			return tenant.Catalog{}, nil, err
 		}
 		catalog.ConfigVersions = append(catalog.ConfigVersions, tenant.ConfigVersion{
 			TenantID: current.TenantID, AgentAppID: current.AgentAppID, Version: current.Version,
@@ -381,11 +442,11 @@ func loadCatalogFile(path string) (tenant.Catalog, error) {
 	for _, profile := range catalog.StorageProfiles {
 		if profile.Kind == tenant.StorageKindRedis {
 			if _, err := envNameFromCredentialRef(profile.CredentialRef); err != nil {
-				return tenant.Catalog{}, err
+				return tenant.Catalog{}, nil, err
 			}
 		}
 	}
-	return catalog, nil
+	return catalog, raw.Messaging, nil
 }
 
 func validateCatalogCredentials(catalog tenant.Catalog, resolver CredentialResolver) error {

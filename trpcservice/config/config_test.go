@@ -14,6 +14,7 @@ func TestLoadPlatformCatalog(t *testing.T) {
 	t.Setenv("IDENTITY_SECRET", strings.Repeat("i", 32))
 	t.Setenv("TENANT_MODEL_KEY", "model-secret")
 	t.Setenv("TENANT_REDIS_URL", "localhost:6379")
+	t.Setenv("PHASE3_MESSAGING_REDIS_URL", "localhost:6379")
 	path := writeCatalogFile(t, validCatalogJSON())
 	t.Setenv("PLATFORM_CONFIG_FILE", path)
 
@@ -40,6 +41,7 @@ func TestLoadPlatformCatalogStrictFailures(t *testing.T) {
 	t.Setenv("IDENTITY_SECRET", strings.Repeat("i", 32))
 	t.Setenv("TENANT_MODEL_KEY", "model-secret")
 	t.Setenv("TENANT_REDIS_URL", "localhost:6379")
+	t.Setenv("PHASE3_MESSAGING_REDIS_URL", "localhost:6379")
 	tests := []struct {
 		name string
 		data []byte
@@ -73,10 +75,26 @@ func TestPhase2ExampleCatalogParses(t *testing.T) {
 	}
 }
 
+func TestPhase3ExampleConfigParses(t *testing.T) {
+	t.Setenv("IDENTITY_SECRET", strings.Repeat("i", 32))
+	t.Setenv("PHASE3_MESSAGING_REDIS_URL", "localhost:6379")
+	t.Setenv("PHASE3_TENANT_REDIS_URL", "localhost:6379")
+	t.Setenv("PHASE3_MODEL_KEY", "model-secret")
+	t.Setenv("PLATFORM_CONFIG_FILE", filepath.Join("..", "..", "configs", "phase3.example.json"))
+	cfg, err := LoadForRole(RoleServe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Messaging == nil || len(cfg.Catalog.Tenants) != 2 {
+		t.Fatalf("unexpected Phase 3 config: %#v", cfg)
+	}
+}
+
 func TestLoadPlatformCatalogValidatesEveryEnabledVersionCredential(t *testing.T) {
 	t.Setenv("IDENTITY_SECRET", strings.Repeat("i", 32))
 	t.Setenv("TENANT_MODEL_KEY", "model-secret")
 	t.Setenv("TENANT_REDIS_URL", "localhost:6379")
+	t.Setenv("PHASE3_MESSAGING_REDIS_URL", "localhost:6379")
 	secondVersion := `,
     {
       "tenant_id":"tenant-a","agent_app_id":"assistant","version":"v2",
@@ -111,6 +129,7 @@ func writeCatalogBytes(t *testing.T, data []byte) string {
 func validCatalogJSON() string {
 	return `{
   "schema_version": 1,
+	"messaging": {"redis_credential_ref":"env:PHASE3_MESSAGING_REDIS_URL","key_prefix":"test-messaging"},
   "tenants": [{"id":"tenant-a","enabled":true}],
   "storage_profiles": [{"tenant_id":"tenant-a","id":"redis-v1","kind":"redis","credential_ref":"env:TENANT_REDIS_URL","key_prefix":"test"}],
   "agent_apps": [{"tenant_id":"tenant-a","id":"assistant","enabled":true,"active_config_version":"v1"}],
@@ -225,16 +244,62 @@ func TestLoadRejectsInvalidAPIKeyEnvironmentNameWithoutEchoingIt(t *testing.T) {
 }
 
 func TestConfigFormattingRedactsSecrets(t *testing.T) {
+	messaging := MessagingConfig{
+		RedisCredentialRef: "env:SENSITIVE_MESSAGING_REF",
+		RedisURL:           "redis://message-user:message-password@sensitive-messaging-host:6379/0",
+	}
 	cfg := Config{
 		ModelAPIKey:    "model-secret-value",
 		ModelBaseURL:   "https://model-user:model-url-secret@example.test/v1?api_key=query-secret",
 		IdentitySecret: []byte("identity-secret-value"),
 		RedisURL:       "redis://user:redis-secret-value@localhost:6379/0",
+		Messaging:      &messaging,
 	}
 	formatted := fmt.Sprintf("%v %#v", cfg, cfg)
-	for _, secret := range []string{"model-secret-value", "model-url-secret", "query-secret", "identity-secret-value", "redis-secret-value"} {
+	for _, secret := range []string{
+		"model-secret-value", "model-url-secret", "query-secret", "identity-secret-value", "redis-secret-value",
+		"SENSITIVE_MESSAGING_REF", "message-password", "sensitive-messaging-host",
+	} {
 		if strings.Contains(formatted, secret) {
 			t.Fatalf("formatted config leaked %q: %s", secret, formatted)
 		}
+	}
+}
+
+func TestLegacyGatewayDoesNotReadModelKeyValue(t *testing.T) {
+	t.Setenv("IDENTITY_SECRET", strings.Repeat("i", 32))
+	t.Setenv("MODEL_NAME", "model")
+	t.Setenv("MODEL_BASE_URL", "https://example.test/v1")
+	t.Setenv("MODEL_API_KEY_ENV", "LEGACY_MISSING_MODEL_KEY")
+	t.Setenv("LEGACY_MISSING_MODEL_KEY", "legacy-model-secret")
+	t.Setenv("REDIS_URL", "localhost:6379")
+	cfg, err := LoadForRole(RoleGateway)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ModelAPIKey != "" || cfg.Messaging == nil || cfg.Messaging.KeyPrefix != DefaultRedisPrefix+":messaging" {
+		t.Fatalf("unexpected legacy Gateway config: %#v", cfg)
+	}
+	t.Setenv("LEGACY_MISSING_MODEL_KEY", "")
+	if _, err := LoadForRole(RoleWorker); err == nil {
+		t.Fatal("legacy Worker unexpectedly accepted missing model key")
+	}
+}
+
+func TestGatewayRoleDoesNotResolveModelCredential(t *testing.T) {
+	t.Setenv("IDENTITY_SECRET", strings.Repeat("i", 32))
+	t.Setenv("TENANT_MODEL_KEY", "")
+	t.Setenv("TENANT_REDIS_URL", "")
+	t.Setenv("PHASE3_MESSAGING_REDIS_URL", "localhost:6379")
+	t.Setenv("PLATFORM_CONFIG_FILE", writeCatalogFile(t, validCatalogJSON()))
+	cfg, err := LoadForRole(RoleGateway)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Messaging == nil || cfg.Messaging.RedisURL != "redis://localhost:6379/0" {
+		t.Fatalf("unexpected Gateway messaging config: %#v", cfg.Messaging)
+	}
+	if _, err := LoadForRole(RoleWorker); err == nil {
+		t.Fatal("Worker unexpectedly accepted missing model/storage credentials")
 	}
 }

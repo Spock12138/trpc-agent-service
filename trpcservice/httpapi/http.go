@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 )
 
 const (
@@ -22,11 +24,27 @@ const (
 
 type Backend interface {
 	Ready(context.Context) error
-	Handle(context.Context, executor.Request) (executor.Reply, error)
+	Handle(context.Context, message.InboundMessage) (message.OutboundMessage, error)
 }
 
 func NewHandler(backend Backend) http.Handler {
 	mux := http.NewServeMux()
+	registerHealth(mux, backend)
+	mux.HandleFunc("/api/v1/demo/messages", messageHandler(backend))
+	return mux
+}
+
+type ReadyBackend interface {
+	Ready(context.Context) error
+}
+
+func NewHealthHandler(backend ReadyBackend) http.Handler {
+	mux := http.NewServeMux()
+	registerHealth(mux, backend)
+	return mux
+}
+
+func registerHealth(mux *http.ServeMux, backend ReadyBackend) {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "", "")
@@ -45,8 +63,6 @@ func NewHandler(backend Backend) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
-	mux.HandleFunc("/api/v1/demo/messages", messageHandler(backend))
-	return mux
 }
 
 type messageRequest struct {
@@ -93,7 +109,7 @@ func messageHandler(backend Backend) http.HandlerFunc {
 			return
 		}
 
-		reply, err := backend.Handle(r.Context(), executor.Request{
+		reply, err := backend.Handle(r.Context(), message.InboundMessage{
 			Channel:        "demo",
 			BindingID:      input.BindingID,
 			MessageID:      input.MessageID,
@@ -105,6 +121,9 @@ func messageHandler(backend Backend) http.HandlerFunc {
 			ReceivedAt:     time.Now().UTC(),
 		})
 		if err != nil {
+			if reply.TraceID != "" {
+				traceID = reply.TraceID
+			}
 			writeMappedError(w, err, requestID, traceID)
 			return
 		}
@@ -138,12 +157,20 @@ func writeMappedError(w http.ResponseWriter, err error, requestID, traceID strin
 	code := "agent_failed"
 	message := "agent request failed"
 	switch {
+	case errors.Is(err, gateway.ErrMessageConflict):
+		status, code, message = http.StatusConflict, "message_conflict", "message ID conflicts with an existing payload"
+	case errors.Is(err, gateway.ErrTaskPending):
+		status, code, message = http.StatusGatewayTimeout, "task_pending", "task is still processing; retry with the same message_id"
+	case errors.Is(err, gateway.ErrMessagingUnavailable):
+		status, code, message = http.StatusServiceUnavailable, "not_ready", "service dependency unavailable"
 	case errors.Is(err, executor.ErrUnknownBinding):
 		status, code, message = http.StatusNotFound, "binding_not_found", "binding not found"
 	case errors.Is(err, executor.ErrRunnerDraining), errors.Is(err, executor.ErrConfigurationUnavailable), errors.Is(err, executor.ErrDependencyUnavailable):
 		status, code, message = http.StatusServiceUnavailable, "not_ready", "service dependency unavailable"
 	case errors.Is(err, executor.ErrAgentTimeout):
 		status, code, message = http.StatusGatewayTimeout, "model_timeout", "model request timed out"
+	case errors.Is(err, executor.ErrWorkerLost):
+		status, code, message = http.StatusBadGateway, "worker_lost", "worker lost while processing task"
 	case errors.Is(err, executor.ErrEmptyAgentResponse):
 		status, code, message = http.StatusBadGateway, "empty_agent_response", "agent returned no text"
 	}

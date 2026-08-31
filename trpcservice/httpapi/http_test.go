@@ -13,6 +13,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 )
 
 type fakeBackend struct {
@@ -73,6 +74,7 @@ func TestMessageHandlerValidationAndErrorMapping(t *testing.T) {
 		{name: "configuration unavailable", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrConfigurationUnavailable, status: http.StatusServiceUnavailable},
 		{name: "runner draining", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrRunnerDraining, status: http.StatusServiceUnavailable},
 		{name: "timeout", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrAgentTimeout, status: http.StatusGatewayTimeout},
+		{name: "worker lost", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrWorkerLost, status: http.StatusBadGateway},
 		{name: "failure", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrEmptyAgentResponse, status: http.StatusBadGateway},
 	}
 	for _, tt := range tests {
@@ -87,6 +89,25 @@ func TestMessageHandlerValidationAndErrorMapping(t *testing.T) {
 				t.Fatalf("status = %d, want %d, body = %s", rec.Code, tt.status, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestWorkerLostErrorMapping(t *testing.T) {
+	handler := NewHandler(fakeBackend{handle: func(context.Context, executor.Request) (executor.Reply, error) {
+		return executor.Reply{TraceID: "task-trace"}, executor.ErrWorkerLost
+	}})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/demo/messages", strings.NewReader(`{"binding_id":"demo-binding","message_id":"m-worker-lost","external_user_id":"u1","conversation_id":"c1","text":"hello"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["code"] != "worker_lost" || body["trace_id"] != "task-trace" {
+		t.Fatalf("unexpected worker_lost response: %#v", body)
 	}
 }
 
@@ -112,6 +133,38 @@ func TestMessageHandlerDoesNotExposeBackendErrors(t *testing.T) {
 		if body[field] == "" {
 			t.Fatalf("error response field %s is empty: %#v", field, body)
 		}
+	}
+}
+
+func TestPhase3ErrorMappingAndOriginalTaskTrace(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{name: "conflict", err: gateway.ErrMessageConflict, status: http.StatusConflict, code: "message_conflict"},
+		{name: "pending", err: gateway.ErrTaskPending, status: http.StatusGatewayTimeout, code: "task_pending"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := NewHandler(fakeBackend{handle: func(context.Context, executor.Request) (executor.Reply, error) {
+				return executor.Reply{TraceID: "original-task-trace"}, tt.err
+			}})
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/demo/messages", strings.NewReader(`{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tt.status {
+				t.Fatalf("status = %d, want %d, body = %s", rec.Code, tt.status, rec.Body.String())
+			}
+			var body map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body["code"] != tt.code || body["trace_id"] != "original-task-trace" || body["request_id"] == "" {
+				t.Fatalf("unexpected response body: %#v", body)
+			}
+		})
 	}
 }
 

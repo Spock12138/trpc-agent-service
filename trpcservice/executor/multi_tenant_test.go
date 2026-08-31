@@ -17,6 +17,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -282,6 +283,54 @@ func TestRuntimeSwitchesActiveConfigWithoutInterruptingOldRequest(t *testing.T) 
 	}
 	if err := registry.Drain(context.Background(), agent.CacheKey{TenantID: "tenant-a", AgentAppID: "assistant", ConfigVersion: "v1"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRuntimeExecuteUsesTaskConfigVersionAfterActiveVersionChanges(t *testing.T) {
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode model request: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"fixed","object":"chat.completion","created":1,"model":"` + body.Model + `","choices":[{"index":0,"message":{"role":"assistant","content":"` + body.Model + `"},"finish_reason":"stop"}]}`))
+	}))
+	defer modelServer.Close()
+
+	baseRepository, err := tenant.NewPresetRepository(versionSwitchCatalog(modelServer.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &switchingRepository{Repository: baseRepository, version: "v1"}
+	credentials := config.NewStaticCredentialResolver(map[string]string{"env:MODEL_KEY": "model-key"})
+	backends, err := storage.NewBackendProvider(repository, credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := agent.NewRunnerRegistry(repository, backends, credentials, agent.DefaultCacheConfig(), newRunner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &Runtime{repository: repository, backends: backends, registry: registry}
+	defer runtime.Close()
+
+	task := message.ExecutionTask{
+		SchemaVersion: message.TaskSchemaVersion, TaskID: "task-fixed-v1", Channel: "demo", ChannelBindingID: "binding-a",
+		TenantID: "tenant-a", AgentAppID: "assistant", ConfigVersion: "v1", RunnerUserID: "user-fixed", SessionID: "session-fixed",
+		PlatformMessageID: "message-fixed", Text: "hello", RequestID: "request-fixed", TraceID: "trace-fixed",
+		ReceivedAt: time.Now().UTC(), Attempt: 1,
+	}
+	task.PayloadDigest = task.CanonicalDigest()
+	repository.SetVersion("v2")
+	reply, err := runtime.Execute(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Text != "model-v1" {
+		t.Fatalf("Execute() reply = %#v, want model-v1", reply)
 	}
 }
 

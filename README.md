@@ -163,6 +163,32 @@ export PHASE2_REDIS_URL='redis://localhost:6379/0'
 
 目录文件只允许 `env:<ENV_NAME>` 凭据引用，不得写入模型 Key 或 Redis URL 明文。未设置 `PLATFORM_CONFIG_FILE` 时继续使用原有单租户环境变量契约。
 
+### Phase 3 可靠消息
+
+Phase 3 将 Demo 请求接入 Redis Streams、Inbox 去重、任务租约和有限重试。`serve` 仍是一条命令启动，但内部会运行一个 Gateway 和一个单并发 Worker，并且不会绕过可靠消息链路：
+
+```bash
+export IDENTITY_SECRET='replace-with-at-least-32-random-bytes'
+export PLATFORM_CONFIG_FILE='configs/phase3.example.json'
+export PHASE3_MODEL_KEY='replace-with-model-key'
+export PHASE3_MESSAGING_REDIS_URL='redis://localhost:6379/0'
+export PHASE3_TENANT_REDIS_URL='redis://localhost:6379/0'
+./start.sh
+```
+
+也可以分别启动两个角色：
+
+```bash
+./bin/trpc-service gateway -addr :8080
+./bin/trpc-service worker -health-addr :8081
+```
+
+Gateway 只需要目录、`IDENTITY_SECRET` 和 Messaging Redis 凭据；Worker 还需要模型及租户存储凭据。两者必须使用相同的 `IDENTITY_SECRET`。Messaging Redis 可以和租户 Redis 使用同一实例，但使用独立客户端与 `<key_prefix>:reliable-v1` 命名空间。
+
+`POST /api/v1/demo/messages` 的成功响应保持不变。Gateway 默认同步等待 75 秒；如果任务仍在重试，会返回 `504 task_pending`，任务不会取消。客户端应使用完全相同的 `message_id` 和消息内容重试，以等待或读取 Inbox 中的缓存结果。幂等窗口由 `inbox_retention` 控制，默认 24 小时；窗口过期后相同消息 ID 会被视为新消息。
+
+Phase 3 只保证一个 Worker 在任意时刻执行。Worker 崩溃或退出后，新 Worker 会在租约过期后恢复 Pending 任务。两个 Worker 并行执行和同一 Session 串行化属于后续阶段。
+
 停止服务：
 
 ```bash

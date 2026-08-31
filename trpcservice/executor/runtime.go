@@ -20,8 +20,8 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	platformmessage "github.com/liuzengh/trpc-agent-service/trpcservice/message"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/routing"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -34,6 +34,7 @@ var (
 	ErrAgentTimeout             = errors.New("agent request timed out")
 	ErrAgentFailed              = errors.New("agent request failed")
 	ErrEmptyAgentResponse       = errors.New("agent returned an empty response")
+	ErrWorkerLost               = errors.New("worker lost while processing task")
 )
 
 type Request = platformmessage.InboundMessage
@@ -42,6 +43,7 @@ type Reply = platformmessage.OutboundMessage
 type Runtime struct {
 	identitySecret []byte
 	repository     tenant.Repository
+	router         *routing.Router
 	backends       *storage.BackendProvider
 	registry       *agent.RunnerRegistry
 
@@ -74,9 +76,16 @@ func New(cfg config.Config) (*Runtime, error) {
 		_ = backends.Close()
 		return nil, err
 	}
+	router, err := routing.New(repository, cfg.IdentitySecret)
+	if err != nil {
+		_ = registry.Close()
+		_ = backends.Close()
+		return nil, err
+	}
 	return &Runtime{
 		identitySecret: append([]byte(nil), cfg.IdentitySecret...),
 		repository:     repository,
+		router:         router,
 		backends:       backends,
 		registry:       registry,
 	}, nil
@@ -131,6 +140,31 @@ func (r *Runtime) backendForBinding(ctx context.Context, channel, bindingID stri
 }
 
 func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
+	router := r.router
+	if router == nil {
+		var err error
+		router, err = routing.New(r.repository, r.identitySecret)
+		if err != nil {
+			return Reply{}, fmt.Errorf("%w: router unavailable", ErrConfigurationUnavailable)
+		}
+	}
+	task, err := router.Resolve(ctx, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, routing.ErrUnknownBinding):
+			return Reply{}, ErrUnknownBinding
+		case errors.Is(err, routing.ErrConfigurationUnavailable):
+			return Reply{}, ErrConfigurationUnavailable
+		default:
+			return Reply{}, err
+		}
+	}
+	return r.Execute(ctx, task)
+}
+
+// Execute runs an immutable task created by the trusted Router. It validates
+// the binding and exact config version again before acquiring a Runner.
+func (r *Runtime) Execute(ctx context.Context, task platformmessage.ExecutionTask) (Reply, error) {
 	// Runtime.Close takes the write lock, so active Runner and backend work is
 	// drained before the registry and borrowed services are closed.
 	r.lifecycle.RLock()
@@ -138,25 +172,30 @@ func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	channel := req.Channel
-	if channel == "" {
-		channel = "demo"
+	if err := task.Validate(); err != nil {
+		return Reply{}, fmt.Errorf("%w: invalid execution task", ErrConfigurationUnavailable)
 	}
-	binding, err := r.repository.ResolveBinding(ctx, channel, req.BindingID)
+	binding, err := r.repository.ResolveBinding(ctx, task.Channel, task.ChannelBindingID)
 	if err != nil {
 		if errors.Is(err, tenant.ErrBindingNotFound) {
 			return Reply{}, ErrUnknownBinding
 		}
 		return Reply{}, fmt.Errorf("%w: binding lookup failed", ErrConfigurationUnavailable)
 	}
+	if binding.TenantID != task.TenantID || binding.AgentAppID != task.AgentAppID {
+		return Reply{}, fmt.Errorf("%w: task binding mismatch", ErrConfigurationUnavailable)
+	}
 	if _, err := r.repository.GetTenant(ctx, binding.TenantID); err != nil {
 		return Reply{}, fmt.Errorf("%w: tenant lookup failed", ErrConfigurationUnavailable)
 	}
-	app, err := r.repository.GetAgentApp(ctx, binding.TenantID, binding.AgentAppID)
+	app, err := r.repository.GetAgentApp(ctx, task.TenantID, task.AgentAppID)
 	if err != nil {
 		return Reply{}, fmt.Errorf("%w: agent app lookup failed", ErrConfigurationUnavailable)
 	}
-	configVersion, err := r.repository.GetConfigVersion(ctx, binding.TenantID, binding.AgentAppID, app.ActiveConfigVersion)
+	if app.TenantID != task.TenantID || app.ID != task.AgentAppID {
+		return Reply{}, fmt.Errorf("%w: task agent app mismatch", ErrConfigurationUnavailable)
+	}
+	configVersion, err := r.repository.GetConfigVersion(ctx, task.TenantID, task.AgentAppID, task.ConfigVersion)
 	if err != nil {
 		return Reply{}, fmt.Errorf("%w: active config lookup failed", ErrConfigurationUnavailable)
 	}
@@ -164,7 +203,7 @@ func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
 	requestCtx, cancel := context.WithTimeout(ctx, configVersion.Model.RequestTimeout)
 	defer cancel()
 	key := agent.CacheKey{
-		TenantID: binding.TenantID, AgentAppID: binding.AgentAppID, ConfigVersion: app.ActiveConfigVersion,
+		TenantID: task.TenantID, AgentAppID: task.AgentAppID, ConfigVersion: task.ConfigVersion,
 	}
 	lease, err := r.registry.Acquire(requestCtx, key)
 	if err != nil {
@@ -183,14 +222,12 @@ func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
 	}
 	defer lease.Release()
 
-	userID := identity.RunnerUserID(r.identitySecret, binding.ID, req.ExternalUserID)
-	sessionID := identity.SessionID(r.identitySecret, binding.ID, req.ConversationID)
 	events, err := lease.Runner.Run(
 		requestCtx,
-		userID,
-		sessionID,
-		model.Message{Role: model.RoleUser, Content: req.Text},
-		frameworkagent.WithRequestID(req.RequestID),
+		task.RunnerUserID,
+		task.SessionID,
+		model.Message{Role: model.RoleUser, Content: task.Text},
+		frameworkagent.WithRequestID(task.RequestID),
 	)
 	if err != nil {
 		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
@@ -201,7 +238,7 @@ func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
 				return Reply{}, fmt.Errorf("%w: selected storage unavailable", ErrDependencyUnavailable)
 			}
 		}
-		return Reply{}, fmt.Errorf("%w: %v", ErrAgentFailed, err)
+		return Reply{}, ErrAgentFailed
 	}
 	text, eventErr := collectText(events)
 	if eventErr != nil {
@@ -216,8 +253,8 @@ func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
 		return Reply{}, eventErr
 	}
 	return Reply{
-		Channel: channel, BindingID: binding.ID, RequestID: req.RequestID,
-		TraceID: req.TraceID, SessionID: sessionID, Text: text,
+		Channel: task.Channel, BindingID: binding.ID, RequestID: task.RequestID,
+		TraceID: task.TraceID, SessionID: task.SessionID, Text: text,
 	}, nil
 }
 
@@ -229,7 +266,7 @@ func collectText(events <-chan *event.Event) (string, error) {
 			continue
 		}
 		if current.IsError() && current.Response != nil && current.Response.Error != nil {
-			eventErr = fmt.Errorf("%w: %s", ErrAgentFailed, current.Response.Error.Message)
+			eventErr = ErrAgentFailed
 			continue
 		}
 		if current.Response == nil || current.IsToolCallResponse() || current.IsToolResultResponse() {
