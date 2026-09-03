@@ -73,3 +73,10 @@ POST 强制使用 `demo` channel，Router 从预置 binding 派生租户和 Agen
 自动化覆盖 v1 拒绝、v2 摘要、可信目标、群主体 Session、凭据契约、重复 Bot、Telegram Fake Bot API、企业微信 Fake WebSocket、Agent 失败统一文本、出站退避/超限/重启恢复和 Web 四态查询。真实 Redis 7 复验 Phase 3 Streams/Gateway 恢复、Phase 4 Strong/双 Worker，以及 Phase 5 outbound attempts 跨 Gateway 恢复。
 
 真实企微 smoke 只从环境变量读取 Bot ID/Secret，不打印值。真实群聊 smoke 是可选项。完整审计、流式/媒体消息、多 Gateway 同 Bot 选主和 IM exactly-once 不属于 Phase 5。
+
+### 真实企微单聊 Smoke 验收记录（2026-09-03）
+
+- 使用真实企业微信 Bot 完成单聊端到端验证；gateway `/readyz=200`，worker `/healthz=200`。
+- 真实订阅响应采用顶层 `errcode=0`、`errmsg=ok`、`headers.req_id` 格式；Adapter 已兼容该官方响应，同时保留 Fake Server 契约格式，渠道测试通过。
+- 消息链路 `aibot_msg_callback` -> Inbox -> Worker/Agent -> `aibot_respond_msg(finish=true)` 已打通。对应任务 `succeeded`，出站仅 1 次尝试即成功，Redis 出站状态已写入 `acked_at`，任务/回复 Stream 消费组无 Pending。
+- 本次 smoke 的临时 gateway/worker 已停止，临时配置已删除；未记录任何 Bot ID、Secret、模型密钥或消息正文。

@@ -32,3 +32,4 @@ data/*
 
 # Local real-model smoke catalog; credentials remain in environment variables.
 /configs/phase2.smoke.json
+/configs/phase5.smoke.json

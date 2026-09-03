@@ -24,6 +24,8 @@ type wecomEnvelope struct {
 	Cmd     string          `json:"cmd"`
 	Headers wecomHeaders    `json:"headers"`
 	Body    json.RawMessage `json:"body,omitempty"`
+	ErrCode *int            `json:"errcode,omitempty"`
+	ErrMsg  string          `json:"errmsg,omitempty"`
 }
 
 type WeComAdapter struct {
@@ -152,17 +154,24 @@ func (a *WeComAdapter) connect(ctx context.Context) error {
 		_ = conn.Close()
 		return err
 	}
-	if response.Cmd != "aibot_subscribe" || response.Headers.ReqID != reqID {
+	if response.Headers.ReqID != reqID {
 		_ = conn.Close()
 		return errors.New("wecom subscription response mismatch")
 	}
-	var result struct {
-		ErrCode int `json:"errcode"`
+	errCode, validResponse := response.ErrCode, response.ErrCode != nil
+	if response.Cmd != "" {
+		if response.Cmd != "aibot_subscribe" {
+			_ = conn.Close()
+			return errors.New("wecom subscription response mismatch")
+		}
+		var result struct {
+			ErrCode *int `json:"errcode"`
+		}
+		if len(response.Body) > 0 && json.Unmarshal(response.Body, &result) == nil && result.ErrCode != nil {
+			errCode, validResponse = result.ErrCode, true
+		}
 	}
-	if len(response.Body) > 0 {
-		_ = json.Unmarshal(response.Body, &result)
-	}
-	if result.ErrCode != 0 {
+	if !validResponse || *errCode != 0 {
 		_ = conn.Close()
 		return errors.New("wecom subscription rejected")
 	}

@@ -173,6 +173,57 @@ func TestWeComDisconnectedEventReconnects(t *testing.T) {
 	}
 }
 
+func TestWeComSubscribeTopLevelErrCode(t *testing.T) {
+	// The real WeCom server acknowledges aibot_subscribe with a top-level
+	// errcode/errmsg and no cmd field; the adapter must treat that as success.
+	accepted := make(chan message.InboundMessage, 1)
+	server := httptest.NewServer(websocket.Handler(func(conn *websocket.Conn) {
+		var subscribe wecomEnvelope
+		if err := websocket.JSON.Receive(conn, &subscribe); err != nil {
+			return
+		}
+		code := 0
+		if err := websocket.JSON.Send(conn, wecomEnvelope{Headers: subscribe.Headers, ErrCode: &code, ErrMsg: "ok"}); err != nil {
+			return
+		}
+		_ = websocket.JSON.Send(conn, wecomEnvelope{
+			Cmd: "aibot_msg_callback", Headers: wecomHeaders{ReqID: "top-req"},
+			Body: mustJSON(map[string]any{"msgid": "m-top", "aibotid": "bot-account", "chattype": "single", "from": map[string]string{"userid": "user-a"}, "text": map[string]string{"content": "top level errcode"}}),
+		})
+		var ignored wecomEnvelope
+		_ = websocket.JSON.Receive(conn, &ignored)
+	}))
+	defer server.Close()
+
+	adapter, err := NewWeComAdapter("wecom-a", "bot-account", "bot-id", "bot-secret", strings.Replace(server.URL, "http://", "ws://", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.reconnectBackoff = 5 * time.Millisecond
+	adapter.maxBackoff = 10 * time.Millisecond
+	adapter.readPollInterval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- adapter.Start(ctx, ingressSinkFunc(func(_ context.Context, inbound message.InboundMessage) (AcceptResult, error) {
+			accepted <- inbound
+			return AcceptResult{TaskID: "accepted"}, nil
+		}))
+	}()
+
+	inbound := receiveWeComInbound(t, accepted)
+	if inbound.PlatformMessageID != "m-top" || inbound.PlatformRequestID != "top-req" || inbound.ActorUserID != "user-a" || inbound.Text != "top level errcode" {
+		t.Fatalf("inbound mapping = %#v", inbound)
+	}
+
+	cancel()
+	_ = adapter.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWeComReplyRequiresCallbackRequestID(t *testing.T) {
 	adapter := &WeComAdapter{}
 	if err := adapter.Send(context.Background(), message.OutboundMessage{ConversationID: "chat-a", Text: "answer"}); err == nil {
