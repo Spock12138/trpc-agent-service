@@ -14,6 +14,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
 )
 
 type Executor interface {
@@ -21,14 +22,20 @@ type Executor interface {
 	Execute(context.Context, message.ExecutionTask) (message.OutboundMessage, error)
 }
 
+type FencedExecutor interface {
+	ExecuteFenced(context.Context, message.ExecutionTask, sessionfence.Fence) (message.OutboundMessage, sessionfence.TurnCommit, error)
+}
+
 type Worker struct {
 	store    *messaging.Store
 	executor Executor
 	consumer string
 
-	running atomic.Bool
-	mu      sync.Mutex
-	cancel  context.CancelFunc
+	running     atomic.Bool
+	mu          sync.Mutex
+	cancel      context.CancelFunc
+	activeDone  chan struct{}
+	activeLease *messaging.Lease
 }
 
 func New(store *messaging.Store, runtime Executor, consumer string) (*Worker, error) {
@@ -37,6 +44,11 @@ func New(store *messaging.Store, runtime Executor, consumer string) (*Worker, er
 	}
 	if consumer == "" {
 		return nil, errors.New("worker consumer name is required")
+	}
+	if store.Config().SessionFencing == "strong" {
+		if _, ok := runtime.(FencedExecutor); !ok {
+			return nil, errors.New("strong session fencing requires a fenced executor")
+		}
 	}
 	return &Worker{store: store, executor: runtime, consumer: consumer}, nil
 }
@@ -71,10 +83,11 @@ func (w *Worker) Run(ctx context.Context) error {
 			return nil
 		}
 		_, _ = w.store.PromoteRetries(runCtx, 32)
+		_, _ = w.store.PromoteSessionWait(runCtx, 32)
 		stale, err := w.store.ClaimStale(runCtx, w.consumer, 16)
 		if err == nil {
 			for _, delivery := range stale {
-				_ = w.store.Recover(runCtx, delivery)
+				_ = w.store.Recover(runCtx, delivery, w.consumer)
 			}
 		}
 
@@ -100,6 +113,19 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
+	w.mu.Lock()
+	activeDone := make(chan struct{})
+	w.activeDone = activeDone
+	w.mu.Unlock()
+	defer func() {
+		w.mu.Lock()
+		if w.activeDone == activeDone {
+			w.activeDone = nil
+			w.activeLease = nil
+		}
+		w.mu.Unlock()
+		close(activeDone)
+	}()
 	if err := delivery.Task.Validate(); err != nil {
 		_ = w.store.Reject(context.Background(), delivery, "invalid_task")
 		return
@@ -111,28 +137,75 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 	}
 	lease, err := w.store.Begin(runCtx, delivery, w.consumer)
 	if err != nil {
+		if errors.Is(err, messaging.ErrSessionBusy) || errors.Is(err, messaging.ErrSessionWait) {
+			_ = w.store.DeferSession(context.Background(), delivery, time.Now(), "session_wait")
+			return
+		}
+		if errors.Is(err, messaging.ErrSessionStale) {
+			_ = w.store.Reject(context.Background(), delivery, "session_stale")
+			return
+		}
 		if errors.Is(err, messaging.ErrLeaseLost) {
 			_ = w.store.RequeueAfterBeginFailure(context.Background(), delivery)
 		}
 		return
 	}
+	w.mu.Lock()
+	w.activeLease = &lease
+	w.mu.Unlock()
 	execCtx, cancel := context.WithCancel(runCtx)
-	heartbeatDone := make(chan error, 1)
-	go w.heartbeat(execCtx, cancel, lease, heartbeatDone)
-	reply, executeErr := w.executor.Execute(execCtx, delivery.Task)
+	heartbeats := 1
+	if w.store.Config().SessionFencing == "strong" {
+		heartbeats = 2
+	}
+	heartbeatDone := make(chan error, heartbeats)
+	go w.taskHeartbeat(execCtx, cancel, lease, heartbeatDone)
+	if heartbeats == 2 {
+		go w.sessionHeartbeat(execCtx, cancel, lease, heartbeatDone)
+	}
+	var reply message.OutboundMessage
+	var executeErr error
+	var turnCommit sessionfence.TurnCommit
+	if fenced, ok := w.executor.(FencedExecutor); ok && w.store.Config().SessionFencing == "strong" {
+		reply, turnCommit, executeErr = fenced.ExecuteFenced(execCtx, delivery.Task, sessionfence.Fence{TaskID: delivery.Task.TaskID, SessionCoord: lease.SessionCoord, SessionSeq: lease.SessionSeq, LeaseEpoch: lease.Epoch, LockToken: lease.LockToken})
+	} else {
+		reply, executeErr = w.executor.Execute(execCtx, delivery.Task)
+	}
 	cancel()
-	heartbeatErr := <-heartbeatDone
-	if heartbeatErr != nil && !errors.Is(heartbeatErr, context.Canceled) {
+	heartbeatFailed := false
+	for i := 0; i < heartbeats; i++ {
+		heartbeatErr := <-heartbeatDone
+		if heartbeatErr != nil && !errors.Is(heartbeatErr, context.Canceled) {
+			heartbeatFailed = true
+		}
+	}
+	if heartbeatFailed {
+		// The lease may have been taken over. Do not issue a retry/fail write
+		// with an unknown fencing state; recovery owns the transition.
 		return
 	}
 
-	transitionCtx, transitionCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	transitionTimeout := 5 * time.Second
+	if runCtx.Err() != nil && w.store.Config().ShutdownTimeout > 0 {
+		transitionTimeout = w.store.Config().ShutdownTimeout
+	}
+	transitionCtx, transitionCancel := context.WithTimeout(context.Background(), transitionTimeout)
 	defer transitionCancel()
 	if runCtx.Err() != nil || errors.Is(executeErr, context.Canceled) {
 		w.retryOrFail(transitionCtx, lease, "worker_shutdown", true)
 		return
 	}
 	if executeErr == nil {
+		if w.store.Config().SessionFencing == "strong" {
+			if turnCommit.SessionCoord == "" {
+				_ = w.store.Fail(transitionCtx, lease, "session_commit_invalid")
+				return
+			}
+			if err := w.store.CompleteTurn(transitionCtx, lease, reply, turnCommit); err != nil {
+				return
+			}
+			return
+		}
 		_ = w.store.Complete(transitionCtx, lease, reply)
 		return
 	}
@@ -144,7 +217,7 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 	w.retryOrFail(transitionCtx, lease, code, false)
 }
 
-func (w *Worker) heartbeat(ctx context.Context, cancel context.CancelFunc, lease messaging.Lease, done chan<- error) {
+func (w *Worker) taskHeartbeat(ctx context.Context, cancel context.CancelFunc, lease messaging.Lease, done chan<- error) {
 	ticker := time.NewTicker(w.store.Config().HeartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -162,16 +235,49 @@ func (w *Worker) heartbeat(ctx context.Context, cancel context.CancelFunc, lease
 	}
 }
 
-func (w *Worker) retryOrFail(ctx context.Context, lease messaging.Lease, code string, immediate bool) {
-	if lease.Delivery.Task.Attempt >= w.store.Config().MaxAttempts {
-		_ = w.store.Fail(ctx, lease, code)
-		return
+func (w *Worker) sessionHeartbeat(ctx context.Context, cancel context.CancelFunc, lease messaging.Lease, done chan<- error) {
+	ticker := time.NewTicker(w.store.Config().HeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			done <- ctx.Err()
+			return
+		case <-ticker.C:
+			if err := w.store.SessionHeartbeat(ctx, lease); err != nil {
+				cancel()
+				done <- err
+				return
+			}
+		}
 	}
-	_ = w.store.Retry(ctx, lease, code, immediate)
+}
+
+func (w *Worker) retryOrFail(ctx context.Context, lease messaging.Lease, code string, immediate bool) {
+	var err error
+	if lease.Delivery.Task.Attempt >= w.store.Config().MaxAttempts {
+		err = w.store.Fail(ctx, lease, code)
+	} else {
+		err = w.store.Retry(ctx, lease, code, immediate)
+	}
+	if err != nil && w.store.Config().SessionFencing == "strong" && immediate {
+		w.releaseAfterAgentCancellation(lease)
+	}
+}
+
+// releaseAfterAgentCancellation is the first of two permitted standalone
+// release_session_lock call sites. It runs only after a canceled Agent could
+// not complete its fenced Retry/Fail transition.
+func (w *Worker) releaseAfterAgentCancellation(lease messaging.Lease) {
+	ctx, cancel := context.WithTimeout(context.Background(), w.store.Config().ShutdownTimeout)
+	defer cancel()
+	_ = w.store.ReleaseSessionLock(ctx, lease)
 }
 
 func classify(err error) (string, bool) {
 	switch {
+	case errors.Is(err, executor.ErrTurnTooLarge):
+		return "session_turn_too_large", false
 	case errors.Is(err, executor.ErrUnknownBinding), errors.Is(err, executor.ErrConfigurationUnavailable):
 		return "configuration_unavailable", false
 	case errors.Is(err, executor.ErrAgentTimeout):
@@ -198,11 +304,37 @@ func (w *Worker) Ready(ctx context.Context) error {
 func (w *Worker) Close() error {
 	w.mu.Lock()
 	cancel := w.cancel
+	activeDone := w.activeDone
+	activeLease := w.activeLease
+	timeout := w.store.Config().ShutdownTimeout
 	w.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+	if activeDone != nil {
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-activeDone:
+		case <-timer.C:
+			if activeLease != nil {
+				w.releaseOnShutdownTimeout(*activeLease)
+			}
+		}
+	}
 	return nil
+}
+
+// releaseOnShutdownTimeout is the second permitted standalone
+// release_session_lock call site. Shutdown actively yields only the exact
+// token/task/epoch captured for the still-running turn.
+func (w *Worker) releaseOnShutdownTimeout(lease messaging.Lease) {
+	ctx, cancel := context.WithTimeout(context.Background(), w.store.Config().ShutdownTimeout)
+	defer cancel()
+	_ = w.store.ReleaseSessionLock(ctx, lease)
 }
 
 func waitContext(ctx context.Context, duration time.Duration) bool {

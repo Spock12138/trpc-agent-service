@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
@@ -77,6 +78,28 @@ func TestSubmitRejectsWrongKeyTypeWithoutPartialWrite(t *testing.T) {
 	}
 }
 
+func TestStrongReadyRejectsUnverifiableTopology(t *testing.T) {
+	server := miniredis.RunT(t)
+	cfg := config.MessagingConfig{
+		RedisURL: "redis://" + server.Addr() + "/0", KeyPrefix: "strong-topology",
+		LeaseDuration: time.Second, HeartbeatInterval: 100 * time.Millisecond,
+		InitialBackoff: time.Millisecond, MaxBackoff: time.Second, MaxAttempts: 3,
+		InboxRetention: time.Hour, ReplyWaitTimeout: time.Second,
+		SessionFencing: "strong", SessionLockDuration: time.Second,
+	}
+	store, err := NewStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Ready(context.Background()); err == nil {
+		t.Fatal("Strong Ready unexpectedly accepted Redis without topology commands")
+	}
+	if server.Exists(store.taskStream) || server.Exists(store.replyStream) {
+		t.Fatal("failed Strong Ready created Stream keys")
+	}
+}
+
 func TestLeaseHeartbeatCompleteAndReply(t *testing.T) {
 	store, _ := newTestStore(t)
 	task := testTask("task-complete", "message-complete")
@@ -111,6 +134,117 @@ func TestLeaseHeartbeatCompleteAndReply(t *testing.T) {
 	}
 	if err := store.Complete(context.Background(), lease, reply); err != ErrLeaseLost {
 		t.Fatalf("late Complete() error = %v, want ErrLeaseLost", err)
+	}
+}
+
+func TestSessionHeartbeatDoesNotRenewTaskLease(t *testing.T) {
+	store, server := newTestStore(t)
+	store.config.SessionFencing = "strong"
+	task := testTask("task-session-heartbeat", "message-session-heartbeat")
+	if _, _, err := store.Submit(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := store.ReadTask(context.Background(), "worker-a", time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Begin(context.Background(), delivery, "worker-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.client.HGet(context.Background(), lease.InboxKey, "lease_until").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now()
+	server.SetTime(base.Add(100 * time.Millisecond))
+	if err := store.SessionHeartbeat(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.client.HGet(context.Background(), lease.InboxKey, "lease_until").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("session heartbeat changed task lease: before=%s after=%s", before, after)
+	}
+	server.SetTime(base.Add(200 * time.Millisecond))
+	pending, err := store.client.XPendingExt(context.Background(), &redis.XPendingExtArgs{Stream: store.taskStream, Group: workerGroup, Start: delivery.StreamID, End: delivery.StreamID, Count: 1}).Result()
+	if err != nil || len(pending) != 1 || pending[0].Idle < 150*time.Millisecond {
+		t.Fatalf("session heartbeat reset task Pending idle: (%#v,%v)", pending, err)
+	}
+	if exists, err := store.client.Exists(context.Background(), store.sessionLockKey(lease.SessionCoord)).Result(); err != nil || exists != 1 {
+		t.Fatalf("session lock missing: exists=%d err=%v", exists, err)
+	}
+}
+
+func TestTaskHeartbeatDoesNotRenewSessionLock(t *testing.T) {
+	store, server := newTestStore(t)
+	store.config.SessionFencing = "strong"
+	task := testTask("task-heartbeat-isolation", "message-heartbeat-isolation")
+	if _, _, err := store.Submit(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := store.ReadTask(context.Background(), "worker-a", time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Begin(context.Background(), delivery, "worker-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockKey := store.sessionLockKey(lease.SessionCoord)
+	before, err := store.client.HGet(context.Background(), lockKey, "expires_at_ms").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetTime(time.Now().Add(100 * time.Millisecond))
+	if err := store.Heartbeat(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.client.HGet(context.Background(), lockKey, "expires_at_ms").Result()
+	if err != nil || after != before {
+		t.Fatalf("task heartbeat changed Session lock expiry: before=%s after=%s err=%v", before, after, err)
+	}
+}
+
+func TestSubmitAllocatesPerSessionSequence(t *testing.T) {
+	store, _ := newTestStore(t)
+	store.config.SessionFencing = "strong"
+	first := testTask("task-seq-1", "message-seq-1")
+	second := testTask("task-seq-2", "message-seq-2")
+	second.SessionID = first.SessionID
+	second.PayloadDigest = second.CanonicalDigest()
+	firstSnapshot, _, err := store.Submit(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSnapshot, _, err := store.Submit(context.Background(), second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstSnapshot.SessionCoord == "" || secondSnapshot.SessionCoord != firstSnapshot.SessionCoord {
+		t.Fatalf("session coords differ: %#v %#v", firstSnapshot, secondSnapshot)
+	}
+	if firstSnapshot.SessionSeq != 1 || secondSnapshot.SessionSeq != 2 {
+		t.Fatalf("session seqs = %d, %d", firstSnapshot.SessionSeq, secondSnapshot.SessionSeq)
+	}
+}
+
+func TestLegacySubmitDoesNotCreateSessionCoordinationKeys(t *testing.T) {
+	store, _ := newTestStore(t)
+	task := testTask("legacy-submit", "legacy-submit-message")
+	snapshot, created, err := store.Submit(context.Background(), task)
+	if err != nil || !created {
+		t.Fatalf("Submit()=(%#v,%v,%v)", snapshot, created, err)
+	}
+	if snapshot.SessionCoord != "" || snapshot.SessionSeq != 0 {
+		t.Fatalf("legacy snapshot contains Session coordination: %#v", snapshot)
+	}
+	coord := sessionCoord(task)
+	count, err := store.client.Exists(context.Background(), store.sessionSeqKey(coord), store.sessionStateKey(coord)).Result()
+	if err != nil || count != 0 {
+		t.Fatalf("legacy Session coordination keys=(%d,%v), want none", count, err)
 	}
 }
 

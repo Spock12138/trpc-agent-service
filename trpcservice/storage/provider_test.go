@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,6 +131,31 @@ func TestBackendProviderPreservesLegacyPrefixAndCloses(t *testing.T) {
 	}
 	if _, err := provider.BackendFor(context.Background(), profile); !errors.Is(err, ErrProviderClosed) {
 		t.Fatalf("BackendFor after Close error = %v", err)
+	}
+}
+
+func TestStrongBackendProviderRejectsInMemoryAndCrossRedis(t *testing.T) {
+	first := miniredis.RunT(t)
+	second := miniredis.RunT(t)
+	repository, err := tenant.NewPresetRepository(providerCatalog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials := config.NewStaticCredentialResolver(map[string]string{
+		"env:MODEL_KEY": "model-key", "env:REDIS_URL": "redis://" + first.Addr() + "/0",
+	})
+	provider, err := NewBackendProvider(repository, credentials, "strong", "phase4", "redis://"+second.Addr()+"/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	memoryProfile, _ := repository.GetStorageProfile(context.Background(), "tenant-memory", "memory-v1")
+	if _, err := provider.BackendFor(context.Background(), memoryProfile); err == nil || !strings.Contains(err.Error(), "rejects inmemory") {
+		t.Fatalf("strong InMemory error=%v", err)
+	}
+	redisProfile, _ := repository.GetStorageProfile(context.Background(), "tenant-redis", "redis-v1")
+	if _, err := provider.BackendFor(context.Background(), redisProfile); err == nil || !strings.Contains(err.Error(), "same URL and DB") {
+		t.Fatalf("cross Redis error=%v", err)
 	}
 }
 

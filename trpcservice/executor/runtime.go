@@ -22,6 +22,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	platformmessage "github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/routing"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -35,6 +36,7 @@ var (
 	ErrAgentFailed              = errors.New("agent request failed")
 	ErrEmptyAgentResponse       = errors.New("agent returned an empty response")
 	ErrWorkerLost               = errors.New("worker lost while processing task")
+	ErrTurnTooLarge             = errors.New("session turn too large")
 )
 
 type Request = platformmessage.InboundMessage
@@ -61,9 +63,22 @@ func New(cfg config.Config) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create tenant repository: %w", err)
 	}
-	backends, err := storage.NewBackendProvider(repository, credentials)
+	fencingMode := config.DefaultSessionFencing
+	if cfg.Messaging != nil && cfg.Messaging.SessionFencing != "" {
+		fencingMode = cfg.Messaging.SessionFencing
+	}
+	messagingPrefix := ""
+	messagingURL := ""
+	if cfg.Messaging != nil {
+		messagingPrefix = cfg.Messaging.KeyPrefix
+		messagingURL = cfg.Messaging.RedisURL
+	}
+	backends, err := storage.NewBackendProvider(repository, credentials, fencingMode, messagingPrefix, messagingURL)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.Messaging != nil {
+		backends.SetTurnLimits(sessionfence.Limits{MaxTurnEvents: cfg.Messaging.MaxTurnEvents, MaxTurnBytes: cfg.Messaging.MaxTurnBytes})
 	}
 	registry, err := agent.NewRunnerRegistry(
 		repository,
@@ -256,6 +271,85 @@ func (r *Runtime) Execute(ctx context.Context, task platformmessage.ExecutionTas
 		Channel: task.Channel, BindingID: binding.ID, RequestID: task.RequestID,
 		TraceID: task.TraceID, SessionID: task.SessionID, Text: text,
 	}, nil
+}
+
+// ExecuteFenced runs a turn against the platform-owned fenced Session
+// namespace. Runner writes are staged locally and committed only after the
+// runner has returned successfully.
+func (r *Runtime) ExecuteFenced(ctx context.Context, task platformmessage.ExecutionTask, fence sessionfence.Fence) (Reply, sessionfence.TurnCommit, error) {
+	r.lifecycle.RLock()
+	defer r.lifecycle.RUnlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := task.Validate(); err != nil {
+		return Reply{}, sessionfence.TurnCommit{}, ErrConfigurationUnavailable
+	}
+	binding, err := r.repository.ResolveBinding(ctx, task.Channel, task.ChannelBindingID)
+	if err != nil || binding.TenantID != task.TenantID || binding.AgentAppID != task.AgentAppID {
+		return Reply{}, sessionfence.TurnCommit{}, ErrUnknownBinding
+	}
+	configVersion, err := r.repository.GetConfigVersion(ctx, task.TenantID, task.AgentAppID, task.ConfigVersion)
+	if err != nil {
+		return Reply{}, sessionfence.TurnCommit{}, ErrConfigurationUnavailable
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, configVersion.Model.RequestTimeout)
+	defer cancel()
+	profile, err := r.repository.GetStorageProfile(ctx, task.TenantID, configVersion.StorageProfileID)
+	if err != nil {
+		return Reply{}, sessionfence.TurnCommit{}, ErrConfigurationUnavailable
+	}
+	backend, err := r.backends.BackendFor(requestCtx, profile)
+	if err != nil {
+		return Reply{}, sessionfence.TurnCommit{}, ErrDependencyUnavailable
+	}
+	svc, ok := backend.Session().(*sessionfence.Service)
+	if !ok {
+		return Reply{}, sessionfence.TurnCommit{}, errors.New("strong session fencing backend is unavailable")
+	}
+	key := agent.CacheKey{TenantID: task.TenantID, AgentAppID: task.AgentAppID, ConfigVersion: task.ConfigVersion}
+	lease, err := r.registry.Acquire(requestCtx, key)
+	if err != nil {
+		return Reply{}, sessionfence.TurnCommit{}, err
+	}
+	defer lease.Release()
+	if fence.UserCoord == "" {
+		fence.UserCoord = sessionfence.UserCoordFor(task.TenantID, task.ChannelBindingID, task.RunnerUserID)
+	}
+	turn := svc.StartTurn(session.Key{AppName: tenant.AppName(task.TenantID, task.AgentAppID), UserID: task.RunnerUserID, SessionID: task.SessionID}, fence)
+	requestCtx, requestCancel := context.WithCancel(requestCtx)
+	defer requestCancel()
+	runCtx := sessionfence.WithTurn(requestCtx, turn)
+	events, err := lease.Runner.Run(runCtx, task.RunnerUserID, task.SessionID, model.Message{Role: model.RoleUser, Content: task.Text}, frameworkagent.WithRequestID(task.RequestID))
+	if err != nil {
+		svc.Discard(turn)
+		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+			return Reply{}, sessionfence.TurnCommit{}, ErrAgentTimeout
+		}
+		return Reply{}, sessionfence.TurnCommit{}, ErrAgentFailed
+	}
+	text, err := collectText(events)
+	if svcTurnTooLarge(turn) {
+		svc.Discard(turn)
+		return Reply{}, sessionfence.TurnCommit{}, ErrTurnTooLarge
+	}
+	if err != nil {
+		svc.Discard(turn)
+		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+			return Reply{}, sessionfence.TurnCommit{}, ErrAgentTimeout
+		}
+		return Reply{}, sessionfence.TurnCommit{}, err
+	}
+	commit, err := svc.Prepare(turn)
+	if err != nil {
+		svc.Discard(turn)
+		return Reply{}, sessionfence.TurnCommit{}, err
+	}
+	return Reply{Channel: task.Channel, BindingID: binding.ID, RequestID: task.RequestID, TraceID: task.TraceID, SessionID: task.SessionID, Text: text}, commit, nil
+}
+
+func svcTurnTooLarge(turn *sessionfence.Turn) bool {
+	return turn != nil && turn.IsOverLimit()
 }
 
 func collectText(events <-chan *event.Event) (string, error) {

@@ -14,6 +14,7 @@ import (
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -33,8 +34,12 @@ type backendKey struct {
 }
 
 type BackendProvider struct {
-	repository  tenant.Repository
-	credentials config.CredentialResolver
+	repository      tenant.Repository
+	credentials     config.CredentialResolver
+	sessionFencing  string
+	messagingPrefix string
+	messagingURL    string
+	turnLimits      sessionfence.Limits
 
 	mu        sync.Mutex
 	backends  map[backendKey]Backend
@@ -43,17 +48,44 @@ type BackendProvider struct {
 	closeErr  error
 }
 
-func NewBackendProvider(repository tenant.Repository, credentials config.CredentialResolver) (*BackendProvider, error) {
+func NewBackendProvider(repository tenant.Repository, credentials config.CredentialResolver, fencing ...string) (*BackendProvider, error) {
 	if repository == nil {
 		return nil, errors.New("tenant repository is required")
 	}
 	if credentials == nil {
 		return nil, errors.New("credential resolver is required")
 	}
+	mode := config.DefaultSessionFencing
+	if len(fencing) > 0 && fencing[0] != "" {
+		mode = fencing[0]
+	}
+	messagingPrefix := ""
+	if len(fencing) > 1 {
+		messagingPrefix = fencing[1]
+	}
+	messagingURL := ""
+	if len(fencing) > 2 {
+		messagingURL = fencing[2]
+	}
 	return &BackendProvider{
 		repository: repository, credentials: credentials,
-		backends: make(map[backendKey]Backend), closeDone: make(chan struct{}),
+		sessionFencing:  mode,
+		messagingPrefix: messagingPrefix,
+		messagingURL:    messagingURL,
+		turnLimits:      sessionfence.Limits{MaxTurnEvents: config.DefaultMaxTurnEvents, MaxTurnBytes: config.DefaultMaxTurnBytes},
+		backends:        make(map[backendKey]Backend), closeDone: make(chan struct{}),
 	}, nil
+}
+
+func (p *BackendProvider) SetTurnLimits(limits sessionfence.Limits) {
+	p.mu.Lock()
+	if limits.MaxTurnEvents > 0 {
+		p.turnLimits.MaxTurnEvents = limits.MaxTurnEvents
+	}
+	if limits.MaxTurnBytes > 0 {
+		p.turnLimits.MaxTurnBytes = limits.MaxTurnBytes
+	}
+	p.mu.Unlock()
 }
 
 // BackendFor creates no more than one backend for a tenant-scoped profile.
@@ -91,6 +123,9 @@ func (p *BackendProvider) BackendFor(ctx context.Context, profile tenant.Storage
 func (p *BackendProvider) newBackend(profile tenant.StorageProfile) (Backend, error) {
 	switch profile.Kind {
 	case tenant.StorageKindInMemory:
+		if p.sessionFencing == "strong" {
+			return nil, errors.New("strong session fencing rejects inmemory storage")
+		}
 		return NewInMemoryBackend(), nil
 	case tenant.StorageKindRedis:
 		value, err := p.credentials.Resolve(profile.CredentialRef)
@@ -101,9 +136,18 @@ func (p *BackendProvider) newBackend(profile tenant.StorageProfile) (Backend, er
 		if err != nil {
 			return nil, errors.New("storage credential is not a valid Redis URL")
 		}
+		if p.sessionFencing == "strong" && strings.TrimSpace(p.messagingURL) != "" {
+			messagingURL, normalizeErr := config.NormalizeRedisURL(p.messagingURL)
+			if normalizeErr != nil || messagingURL != redisURL {
+				return nil, errors.New("strong session fencing requires Messaging and Session Redis to use the same URL and DB")
+			}
+		}
 		prefix := strings.TrimRight(strings.TrimSpace(profile.KeyPrefix), ":")
 		if !profile.LegacyPrefix {
 			prefix += ":tenant:" + profile.TenantID + ":profile:" + profile.ID
+		}
+		if p.sessionFencing == "strong" {
+			return NewFencedRedisBackendWithConfig(redisURL, prefix, p.turnLimits, p.messagingPrefix, p.messagingURL)
 		}
 		return NewRedisBackend(redisURL, prefix)
 	default:

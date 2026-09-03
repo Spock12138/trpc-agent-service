@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/redistopology"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
 	"github.com/redis/go-redis/v9"
 	frameworkmemory "trpc.group/trpc-go/trpc-agent-go/memory"
 	memoryredis "trpc.group/trpc-go/trpc-agent-go/memory/redis"
@@ -31,18 +33,43 @@ type RedisBackend struct {
 	newSession   func() (session.Service, error)
 	newMemory    func() (frameworkmemory.Service, error)
 
-	mu        sync.Mutex
-	closed    bool
-	closeDone chan struct{}
-	session   session.Service
-	memory    frameworkmemory.Service
-	closeErr  error
+	mu           sync.Mutex
+	closed       bool
+	closeDone    chan struct{}
+	session      session.Service
+	memory       frameworkmemory.Service
+	closeErr     error
+	strong       bool
+	redisURL     string
+	messagingURL string
 }
 
 // NewRedisBackend validates the Redis URL and namespace without contacting
 // Redis. The normalized prefix is always isolated below the official-v1
 // namespace so Phase 1 snapshot keys are never read or migrated.
 func NewRedisBackend(redisURL, prefix string) (*RedisBackend, error) {
+	return newRedisBackend(redisURL, prefix, false, prefix, nil, "")
+}
+
+// NewFencedRedisBackend creates a Redis backend whose Session service writes
+// to the platform-owned fenced-v1 namespace.
+func NewFencedRedisBackend(redisURL, prefix string, messagingPrefix ...string) (*RedisBackend, error) {
+	return NewFencedRedisBackendWithConfig(redisURL, prefix, sessionfence.Limits{MaxTurnEvents: 512, MaxTurnBytes: 2 << 20}, firstString(messagingPrefix), "")
+}
+
+func NewFencedRedisBackendWithLimits(redisURL, prefix string, limits sessionfence.Limits, messagingPrefix ...string) (*RedisBackend, error) {
+	return NewFencedRedisBackendWithConfig(redisURL, prefix, limits, firstString(messagingPrefix), "")
+}
+
+func NewFencedRedisBackendWithConfig(redisURL, prefix string, limits sessionfence.Limits, messagingPrefix, messagingURL string) (*RedisBackend, error) {
+	coordPrefix := prefix
+	if strings.TrimSpace(messagingPrefix) != "" {
+		coordPrefix = messagingPrefix
+	}
+	return newRedisBackend(redisURL, prefix, true, coordPrefix, []sessionfence.Limits{limits}, messagingURL)
+}
+
+func newRedisBackend(redisURL, prefix string, fenced bool, coordPrefix string, limits []sessionfence.Limits, messagingURL string) (*RedisBackend, error) {
 	redisURL = strings.TrimSpace(redisURL)
 	if redisURL == "" {
 		return nil, errors.New("redis url is empty")
@@ -61,8 +88,25 @@ func NewRedisBackend(redisURL, prefix string) (*RedisBackend, error) {
 		healthClient: redis.NewClient(options),
 		prefix:       officialPrefix,
 		closeDone:    make(chan struct{}),
+		strong:       fenced,
+		redisURL:     redisURL,
+		messagingURL: messagingURL,
 	}
 	backend.newSession = func() (session.Service, error) {
+		if fenced {
+			// Strong mode stores fenced Session data below the same global
+			// prefix as messaging so CompleteTurn can commit both domains in
+			// one Redis Lua invocation. tenant/session coordinates remain part
+			// of the opaque keys and preserve isolation.
+			svc, err := sessionfence.New(redisURL, coordPrefix, coordPrefix)
+			if err != nil {
+				return nil, err
+			}
+			if len(limits) > 0 {
+				svc.SetLimits(limits[0])
+			}
+			return svc, nil
+		}
 		return sessionredis.NewService(
 			sessionredis.WithRedisClientURL(redisURL),
 			sessionredis.WithKeyPrefix(officialPrefix),
@@ -94,6 +138,13 @@ func NewRedisBackend(redisURL, prefix string) (*RedisBackend, error) {
 	return backend, nil
 }
 
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
 // Ready verifies Redis and initializes the official services on the first
 // successful probe. If Redis is unavailable, no service is retained and a
 // later Ready call retries initialization after recovery.
@@ -109,6 +160,11 @@ func (b *RedisBackend) Ready(ctx context.Context) error {
 	}
 	if err := b.healthClient.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("redis ping: %w", err)
+	}
+	if b.strong {
+		if err := verifyStrongRedisTopology(ctx, b.healthClient.(*redis.Client), b.redisURL, b.messagingURL); err != nil {
+			return err
+		}
 	}
 	if b.session != nil && b.memory != nil {
 		return nil
@@ -152,6 +208,33 @@ func (b *RedisBackend) Ready(ctx context.Context) error {
 
 	b.session = sessions
 	b.memory = memories
+	return nil
+}
+
+func verifyStrongRedisTopology(ctx context.Context, client *redis.Client, redisURL, messagingURL string) error {
+	runID, err := redistopology.VerifyPrimaryStandalone(ctx, client)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(messagingURL) == "" {
+		return nil
+	}
+	messageOpts, err := redis.ParseURL(messagingURL)
+	if err != nil {
+		return fmt.Errorf("parse messaging Redis URL: %w", err)
+	}
+	messageClient := redis.NewClient(messageOpts)
+	defer messageClient.Close()
+	if err := messageClient.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("messaging Redis ping: %w", err)
+	}
+	messagingRunID, err := redistopology.VerifyPrimaryStandalone(ctx, messageClient)
+	if err != nil {
+		return err
+	}
+	if runID != messagingRunID {
+		return errors.New("strong session fencing requires messaging and session Redis to share run_id")
+	}
 	return nil
 }
 

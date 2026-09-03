@@ -187,7 +187,34 @@ Gateway 只需要目录、`IDENTITY_SECRET` 和 Messaging Redis 凭据；Worker 
 
 `POST /api/v1/demo/messages` 的成功响应保持不变。Gateway 默认同步等待 75 秒；如果任务仍在重试，会返回 `504 task_pending`，任务不会取消。客户端应使用完全相同的 `message_id` 和消息内容重试，以等待或读取 Inbox 中的缓存结果。幂等窗口由 `inbox_retention` 控制，默认 24 小时；窗口过期后相同消息 ID 会被视为新消息。
 
-Phase 3 只保证一个 Worker 在任意时刻执行。Worker 崩溃或退出后，新 Worker 会在租约过期后恢复 Pending 任务。两个 Worker 并行执行和同一 Session 串行化属于后续阶段。
+Phase 3 的默认 `session_fencing=legacy` 保持单 Worker 契约。Worker 崩溃或退出后，新 Worker 会在租约过期后恢复 Pending 任务。Phase 3 的实现与验收见 [`docs/stage3-reliable-messaging.md`](docs/stage3-reliable-messaging.md)。
+
+### Phase 4 双 Worker 与 Strong Session Fencing
+
+Phase 4 增加显式 `session_fencing=strong`。两个独立 Worker 可以共享 Consumer Group：同一 Session 按 Redis `session_seq` 严格串行，不同 Session 可以并行；task lease 和 Session lock 都失效后，其他 Worker 才能接管原 Pending。旧 Worker 的迟到 Session commit、Retry、Fail、Recover 和 release 都会被 fencing 拒绝。
+
+使用 Strong 示例：
+
+```bash
+export IDENTITY_SECRET='replace-with-at-least-32-random-bytes'
+export PLATFORM_CONFIG_FILE='configs/phase4.example.json'
+export PHASE4_MODEL_KEY='replace-with-model-key'
+export PHASE4_REDIS_URL='redis://localhost:6379/0'
+
+./bin/trpc-service gateway -addr :8080 -consumer gateway-a
+./bin/trpc-service worker -health-addr :8081 -consumer worker-a
+./bin/trpc-service worker -health-addr :8082 -consumer worker-b
+```
+
+Strong 模式有以下硬约束：
+
+- Messaging 与所有活动 Session StorageProfile 必须使用同一 Redis URL、logical DB 和 primary `run_id`；
+- Redis 必须是可验证的 standalone primary；InMemory、Redis Cluster、跨 Redis、不可验证代理和 fallback 都会被拒绝；
+- Session 数据使用 `<key_prefix>:reliable-v1:fenced-v1`，不读取或迁移旧 namespace；
+- `max_turn_events` 和 `max_turn_bytes` 默认分别为 512 与 2 MiB，超限只产生一次 `session_turn_too_large` 终态；
+- task heartbeat 只续 task lease/Pending，Session heartbeat 只续 Session lock。
+
+完整 key schema、状态转换、恢复规则、测试矩阵和真实 Redis 7.4.11 验收见 [`docs/stage4-two-workers-session-lock.md`](docs/stage4-two-workers-session-lock.md)。Strong fencing 保护 Session/Inbox/Reply，不承诺模型、Tool、Memory 或外部系统副作用 exactly-once。
 
 停止服务：
 

@@ -3,12 +3,16 @@ package storage
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	miniserver "github.com/alicebob/miniredis/v2/server"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
+	"github.com/redis/go-redis/v9"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -303,4 +307,65 @@ func TestRedisBackendConcurrentClose(t *testing.T) {
 			t.Fatalf("Close() error = %v", err)
 		}
 	}
+}
+
+func TestStrongTopologyRejectsRunIDMismatch(t *testing.T) {
+	first := miniredis.RunT(t)
+	second := miniredis.RunT(t)
+	mockStorageTopology(first, "run-a")
+	mockStorageTopology(second, "run-b")
+	client := redis.NewClient(&redis.Options{Addr: first.Addr()})
+	defer client.Close()
+	err := verifyStrongRedisTopology(context.Background(), client, "redis://"+first.Addr()+"/0", "redis://"+second.Addr()+"/0")
+	if err == nil || !strings.Contains(err.Error(), "share run_id") {
+		t.Fatalf("run_id mismatch error=%v", err)
+	}
+}
+
+func TestStrongRedisBackendReadinessRecoversWithoutRecreation(t *testing.T) {
+	server := miniredis.RunT(t)
+	redisURL := "redis://" + server.Addr() + "/0"
+	backend, err := NewFencedRedisBackendWithConfig(redisURL, "phase4-recovery", sessionfence.Limits{MaxTurnEvents: 8, MaxTurnBytes: 4096}, "phase4-messaging", redisURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	server.Close()
+	if err := backend.Ready(context.Background()); err == nil {
+		t.Fatal("Strong Ready unexpectedly succeeded while Redis was stopped")
+	}
+	if backend.Session() != nil || backend.Memory() != nil {
+		t.Fatal("failed Strong Ready retained partially initialized services")
+	}
+	if err := server.Restart(); err != nil {
+		t.Fatal(err)
+	}
+	mockStorageTopology(server, "recovered-run")
+	if err := backend.Ready(context.Background()); err != nil {
+		t.Fatalf("Strong Ready after Redis recovery: %v", err)
+	}
+	if backend.Session() == nil || backend.Memory() == nil {
+		t.Fatal("recovered Strong backend did not initialize services")
+	}
+}
+
+func mockStorageTopology(server *miniredis.Miniredis, runID string) {
+	server.Server().SetPreHook(func(peer *miniserver.Peer, command string, _ ...string) bool {
+		switch command {
+		case "ROLE":
+			peer.WriteLen(3)
+			peer.WriteBulk("master")
+			peer.WriteInt(0)
+			peer.WriteLen(0)
+			return true
+		case "INFO":
+			peer.WriteBulk("# Server\r\nrun_id:" + runID + "\r\n")
+			return true
+		case "CLUSTER":
+			peer.WriteError("ERR This instance has cluster support disabled")
+			return true
+		default:
+			return false
+		}
+	})
 }

@@ -5,6 +5,7 @@ package messaging
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,7 +19,9 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/keyspace"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/redistopology"
 )
 
 const (
@@ -33,24 +36,33 @@ const (
 )
 
 var (
-	ErrConflict     = errors.New("message idempotency conflict")
-	ErrInboxMissing = errors.New("inbox entry is missing")
-	ErrLeaseLost    = errors.New("task lease is lost")
-	ErrTerminal     = errors.New("task is already terminal")
-	ErrKeyType      = errors.New("messaging Redis key has an incompatible type")
-	ErrClosed       = errors.New("messaging store is closed")
+	ErrConflict          = errors.New("message idempotency conflict")
+	ErrInboxMissing      = errors.New("inbox entry is missing")
+	ErrLeaseLost         = errors.New("task lease is lost")
+	ErrTerminal          = errors.New("task is already terminal")
+	ErrKeyType           = errors.New("messaging Redis key has an incompatible type")
+	ErrClosed            = errors.New("messaging store is closed")
+	ErrSessionBusy       = errors.New("session is busy")
+	ErrSessionWait       = errors.New("session is waiting for predecessor")
+	ErrSessionStale      = errors.New("session sequence is stale")
+	ErrSessionLockActive = errors.New("session lock is still active")
 )
 
 type Snapshot struct {
-	InboxKey   string
-	TaskID     string
-	Digest     string
-	State      string
-	Attempt    int
-	TraceID    string
-	ErrorCode  string
-	Result     *message.TaskResult
-	RawPayload string
+	InboxKey     string
+	TaskID       string
+	Digest       string
+	State        string
+	Attempt      int
+	TraceID      string
+	ErrorCode    string
+	Result       *message.TaskResult
+	RawPayload   string
+	SessionCoord string
+	SessionSeq   int64
+	Owner        string
+	LeaseEpoch   int64
+	LeaseUntil   int64
 }
 
 func (s Snapshot) Terminal() bool {
@@ -58,16 +70,21 @@ func (s Snapshot) Terminal() bool {
 }
 
 type Delivery struct {
-	StreamID string
-	InboxID  string
-	Task     message.ExecutionTask
+	StreamID        string
+	InboxID         string
+	Task            message.ExecutionTask
+	PendingConsumer string
+	PendingIdle     time.Duration
 }
 
 type Lease struct {
-	Delivery Delivery
-	InboxKey string
-	Owner    string
-	Epoch    int64
+	Delivery     Delivery
+	InboxKey     string
+	Owner        string
+	Epoch        int64
+	SessionCoord string
+	SessionSeq   int64
+	LockToken    string
 }
 
 type ReplyDelivery struct {
@@ -79,11 +96,12 @@ type Store struct {
 	client *redis.Client
 	config config.MessagingConfig
 
-	basePrefix  string
-	taskStream  string
-	replyStream string
-	retryKey    string
-	inboxPrefix string
+	basePrefix     string
+	taskStream     string
+	replyStream    string
+	retryKey       string
+	inboxPrefix    string
+	sessionWaitKey string
 
 	mu        sync.RWMutex
 	closed    bool
@@ -92,6 +110,27 @@ type Store struct {
 }
 
 func NewStore(cfg config.MessagingConfig) (*Store, error) {
+	if cfg.SessionFencing == "" {
+		cfg.SessionFencing = config.DefaultSessionFencing
+	}
+	if cfg.SessionLockDuration == 0 {
+		cfg.SessionLockDuration = cfg.LeaseDuration
+	}
+	if cfg.SessionWaitBackoff == 0 {
+		cfg.SessionWaitBackoff = config.DefaultSessionWaitBackoff
+	}
+	if cfg.SessionWaitMaxBackoff == 0 {
+		cfg.SessionWaitMaxBackoff = config.DefaultSessionWaitMaxBackoff
+	}
+	if cfg.MaxTurnEvents == 0 {
+		cfg.MaxTurnEvents = config.DefaultMaxTurnEvents
+	}
+	if cfg.MaxTurnBytes == 0 {
+		cfg.MaxTurnBytes = config.DefaultMaxTurnBytes
+	}
+	if cfg.ShutdownTimeout == 0 {
+		cfg.ShutdownTimeout = config.DefaultShutdownTimeout
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -99,11 +138,12 @@ func NewStore(cfg config.MessagingConfig) (*Store, error) {
 	if err != nil {
 		return nil, errors.New("parse messaging Redis URL")
 	}
-	base := strings.TrimRight(cfg.KeyPrefix, ":") + ":reliable-v1"
+	base := keyspace.CoordinationPrefix(cfg.KeyPrefix)
 	return &Store{
 		client: redis.NewClient(options), config: cfg, basePrefix: base,
 		taskStream: base + ":agent.tasks", replyStream: base + ":agent.replies",
 		retryKey: base + ":agent.retry", inboxPrefix: base + ":inbox:",
+		sessionWaitKey: keyspace.SessionWait(cfg.KeyPrefix),
 	}, nil
 }
 
@@ -113,6 +153,11 @@ func (s *Store) Ready(ctx context.Context) error {
 	}
 	if err := s.client.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("messaging Redis ping: %w", err)
+	}
+	if s.config.SessionFencing == "strong" {
+		if _, err := redistopology.VerifyPrimaryStandalone(ctx, s.client); err != nil {
+			return fmt.Errorf("messaging Redis topology: %w", err)
+		}
 	}
 	if err := createGroup(ctx, s.client, s.taskStream, workerGroup); err != nil {
 		return err
@@ -144,19 +189,41 @@ func (s *Store) Submit(ctx context.Context, task message.ExecutionTask) (Snapsho
 	}
 	inboxID := task.InboxID()
 	inboxKey := s.inboxKey(inboxID)
-	result, err := submitScript.Run(ctx, s.client, []string{inboxKey, s.taskStream},
-		task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID).Int()
-	if err != nil {
-		return Snapshot{}, false, fmt.Errorf("submit reliable task: %w", err)
-	}
-	if result == -1 {
-		return Snapshot{}, false, ErrConflict
-	}
-	if result == -9 {
-		return Snapshot{}, false, ErrKeyType
+	created := false
+	if s.config.SessionFencing == "strong" {
+		coord := sessionCoord(task)
+		result, runErr := submitWithSessionScript.Run(ctx, s.client, []string{inboxKey, s.taskStream, s.sessionSeqKey(coord), s.sessionStateKey(coord)},
+			task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID, coord,
+			strconv.FormatInt(time.Now().UnixMilli(), 10)).Slice()
+		if runErr != nil {
+			return Snapshot{}, false, fmt.Errorf("submit reliable task: %w", runErr)
+		}
+		if len(result) == 1 && asInt64(result[0]) == -1 {
+			return Snapshot{}, false, ErrConflict
+		}
+		if len(result) == 1 && asInt64(result[0]) == -9 {
+			return Snapshot{}, false, ErrKeyType
+		}
+		created = len(result) > 0 && asInt64(result[0]) == 1
+	} else {
+		result, runErr := legacySubmitScript.Run(ctx, s.client, []string{inboxKey, s.taskStream},
+			task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID).Int()
+		if runErr != nil {
+			return Snapshot{}, false, fmt.Errorf("submit reliable task: %w", runErr)
+		}
+		if result == -1 {
+			return Snapshot{}, false, ErrConflict
+		}
+		if result == -9 {
+			return Snapshot{}, false, ErrKeyType
+		}
+		created = result == 1
 	}
 	snapshot, err := s.snapshotByKey(ctx, inboxKey)
-	return snapshot, result == 1, err
+	if err != nil {
+		return Snapshot{}, false, err
+	}
+	return snapshot, created, nil
 }
 
 func (s *Store) Snapshot(ctx context.Context, inboxID string) (Snapshot, error) {
@@ -174,9 +241,12 @@ func (s *Store) snapshotByKey(ctx context.Context, inboxKey string) (Snapshot, e
 	snapshot := Snapshot{
 		InboxKey: inboxKey, TaskID: values["task_id"], Digest: values["digest"],
 		State: values["state"], TraceID: values["trace_id"], ErrorCode: values["error_code"],
-		RawPayload: values["payload"],
+		RawPayload: values["payload"], SessionCoord: values["session_coord"], Owner: values["owner"],
 	}
 	snapshot.Attempt, _ = strconv.Atoi(values["attempt"])
+	snapshot.SessionSeq, _ = strconv.ParseInt(values["session_seq"], 10, 64)
+	snapshot.LeaseEpoch, _ = strconv.ParseInt(values["lease_epoch"], 10, 64)
+	snapshot.LeaseUntil, _ = strconv.ParseInt(values["lease_until"], 10, 64)
 	if raw := values["result"]; raw != "" {
 		var result message.TaskResult
 		if err := decodeStrictJSON(raw, &result); err != nil {
@@ -228,9 +298,26 @@ func (s *Store) Begin(ctx context.Context, delivery Delivery, consumer string) (
 		return Lease{}, err
 	}
 	inboxKey := s.inboxKey(delivery.InboxID)
-	value, err := beginScript.Run(ctx, s.client, []string{inboxKey},
-		delivery.Task.TaskID, delivery.Task.PayloadDigest, consumer, delivery.StreamID,
-		delivery.Task.Attempt, now.Add(s.config.LeaseDuration).UnixMilli()).Slice()
+	snapshot, err := s.snapshotByKey(ctx, inboxKey)
+	if err != nil {
+		return Lease{}, err
+	}
+	coord := snapshot.SessionCoord
+	if coord == "" {
+		coord = sessionCoord(delivery.Task)
+	}
+	lockToken := randomToken()
+	var value []interface{}
+	if s.config.SessionFencing == "strong" {
+		value, err = beginScript.Run(ctx, s.client, []string{inboxKey, s.sessionLockKey(coord), s.sessionStateKey(coord)},
+			delivery.Task.TaskID, delivery.Task.PayloadDigest, consumer, delivery.StreamID,
+			delivery.Task.Attempt, now.Add(s.config.LeaseDuration).UnixMilli(), lockToken,
+			s.config.SessionLockDuration.Milliseconds(), coord, snapshot.SessionSeq, now.Add(s.config.SessionLockDuration).UnixMilli()).Slice()
+	} else {
+		value, err = legacyBeginScript.Run(ctx, s.client, []string{inboxKey},
+			delivery.Task.TaskID, delivery.Task.PayloadDigest, consumer, delivery.StreamID,
+			delivery.Task.Attempt, now.Add(s.config.LeaseDuration).UnixMilli()).Slice()
+	}
 	if err != nil {
 		return Lease{}, err
 	}
@@ -240,10 +327,19 @@ func (s *Store) Begin(ctx context.Context, delivery Delivery, consumer string) (
 	if asInt64(value[0]) == -9 {
 		return Lease{}, ErrKeyType
 	}
+	if asInt64(value[0]) == -3 {
+		return Lease{}, ErrSessionBusy
+	}
+	if asInt64(value[0]) == -4 {
+		return Lease{}, ErrSessionWait
+	}
+	if asInt64(value[0]) == -5 {
+		return Lease{}, ErrSessionStale
+	}
 	if asInt64(value[0]) != 1 {
 		return Lease{}, ErrLeaseLost
 	}
-	return Lease{Delivery: delivery, InboxKey: inboxKey, Owner: consumer, Epoch: asInt64(value[1])}, nil
+	return Lease{Delivery: delivery, InboxKey: inboxKey, Owner: consumer, Epoch: asInt64(value[1]), SessionCoord: coord, SessionSeq: snapshot.SessionSeq, LockToken: lockToken}, nil
 }
 
 // RequeueAfterBeginFailure removes this consumer's Pending entry without
@@ -269,9 +365,13 @@ func (s *Store) Heartbeat(ctx context.Context, lease Lease) error {
 	if err != nil {
 		return err
 	}
-	result, err := heartbeatScript.Run(ctx, s.client, []string{lease.InboxKey, s.taskStream},
-		lease.Delivery.Task.TaskID, lease.Owner, lease.Epoch, lease.Delivery.StreamID,
-		now.Add(s.config.LeaseDuration).UnixMilli(), workerGroup).Int()
+	script := taskHeartbeatScript
+	args := []interface{}{lease.Delivery.Task.TaskID, lease.Owner, lease.Epoch, lease.Delivery.StreamID, now.Add(s.config.LeaseDuration).UnixMilli(), workerGroup}
+	if s.config.SessionFencing == "strong" {
+		script = strongTaskHeartbeatScript
+		args = append(args, lease.Delivery.Task.PayloadDigest, now.UnixMilli())
+	}
+	result, err := script.Run(ctx, s.client, []string{lease.InboxKey, s.taskStream}, args...).Int()
 	if err != nil {
 		return err
 	}
@@ -282,6 +382,107 @@ func (s *Store) Heartbeat(ctx context.Context, lease Lease) error {
 		return ErrLeaseLost
 	}
 	return nil
+}
+
+// SessionHeartbeat renews only the Session lock. Task lease and Stream
+// Pending are intentionally owned by Heartbeat.
+func (s *Store) SessionHeartbeat(ctx context.Context, lease Lease) error {
+	now, err := s.redisTime(ctx)
+	if err != nil {
+		return err
+	}
+	result, err := sessionHeartbeatScript.Run(ctx, s.client,
+		[]string{s.sessionLockKey(lease.SessionCoord), lease.InboxKey},
+		lease.Delivery.Task.TaskID, lease.Owner, lease.Epoch, lease.LockToken,
+		s.config.SessionLockDuration.Milliseconds(),
+		now.Add(s.config.SessionLockDuration).UnixMilli(), lease.Delivery.Task.PayloadDigest, now.UnixMilli()).Int()
+	if err != nil {
+		return err
+	}
+	if result == -9 {
+		return ErrKeyType
+	}
+	if result != 1 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// DeferSession moves a queued task into the Session wait set without
+// increasing its retry attempt.
+func (s *Store) DeferSession(ctx context.Context, delivery Delivery, due time.Time, reason string) error {
+	now, err := s.redisTime(ctx)
+	if err != nil {
+		return err
+	}
+	if due.IsZero() {
+		due = now
+	}
+	result, err := deferSessionScript.Run(ctx, s.client,
+		[]string{s.inboxKey(delivery.InboxID), s.sessionWaitKey, s.taskStream},
+		delivery.Task.TaskID, delivery.Task.PayloadDigest, delivery.StreamID,
+		due.UnixMilli(), workerGroup, reason, s.config.SessionWaitBackoff.Milliseconds(), s.config.SessionWaitMaxBackoff.Milliseconds(), now.UnixMilli()).Int()
+	if err != nil {
+		return err
+	}
+	if result == -9 {
+		return ErrKeyType
+	}
+	if result != 1 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// PromoteSessionWait atomically requeues due Session-wait members. Multiple
+// workers may call this concurrently; the ZSET membership check makes the
+// operation idempotent.
+func (s *Store) PromoteSessionWait(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		limit = 32
+	}
+	now, err := s.redisTime(ctx)
+	if err != nil {
+		return 0, err
+	}
+	members, err := s.client.ZRangeByScore(ctx, s.sessionWaitKey, &redis.ZRangeBy{Min: "-inf", Max: strconv.FormatInt(now.UnixMilli(), 10), Offset: 0, Count: int64(limit)}).Result()
+	if err != nil {
+		return 0, err
+	}
+	promoted := 0
+	for _, member := range members {
+		parts := strings.SplitN(member, "|", 2)
+		if len(parts) != 2 {
+			_ = s.client.ZRem(ctx, s.sessionWaitKey, member).Err()
+			continue
+		}
+		inboxKey, oldStream := parts[0], parts[1]
+		values, e := s.client.HGetAll(ctx, inboxKey).Result()
+		if e != nil || len(values) == 0 {
+			_ = s.client.ZRem(ctx, s.sessionWaitKey, member).Err()
+			continue
+		}
+		coord := values["session_coord"]
+		if coord == "" {
+			_ = s.client.ZRem(ctx, s.sessionWaitKey, member).Err()
+			continue
+		}
+		result, e := promoteSessionScript.Run(ctx, s.client, []string{s.sessionWaitKey, inboxKey, s.taskStream, s.sessionStateKey(coord), s.sessionLockKey(coord)}, member, now.UnixMilli(), s.config.SessionWaitBackoff.Milliseconds(), s.config.SessionWaitMaxBackoff.Milliseconds()).Int()
+		if e != nil {
+			return promoted, e
+		}
+		if result == -9 {
+			return promoted, ErrKeyType
+		}
+		if result == -1 {
+			return promoted, ErrLeaseLost
+		}
+		if result == 1 {
+			promoted++
+		}
+		_ = oldStream
+	}
+	return promoted, nil
 }
 
 func (s *Store) Retry(ctx context.Context, lease Lease, errorCode string, immediate bool) error {
@@ -299,9 +500,17 @@ func (s *Store) Retry(ctx context.Context, lease Lease, errorCode string, immedi
 	if !immediate {
 		delay = s.backoff(lease.Delivery.Task.Attempt)
 	}
-	result, err := retryScript.Run(ctx, s.client, []string{lease.InboxKey, s.retryKey, s.taskStream},
-		lease.Delivery.Task.TaskID, lease.Owner, lease.Epoch, lease.Delivery.StreamID,
-		next.Attempt, string(payload), now.Add(delay).UnixMilli(), errorCode, workerGroup).Int()
+	var result int
+	if s.config.SessionFencing == "strong" {
+		result, err = retryScript.Run(ctx, s.client, []string{lease.InboxKey, s.sessionLockKey(lease.SessionCoord), s.retryKey, s.taskStream},
+			lease.Delivery.Task.TaskID, lease.Owner, lease.Epoch, lease.LockToken, lease.Delivery.StreamID,
+			next.Attempt, string(payload), now.Add(delay).UnixMilli(), errorCode, workerGroup,
+			lease.Delivery.Task.PayloadDigest, now.UnixMilli()).Int()
+	} else {
+		result, err = legacyRetryScript.Run(ctx, s.client, []string{lease.InboxKey, s.retryKey, s.taskStream},
+			lease.Delivery.Task.TaskID, lease.Owner, lease.Epoch, lease.Delivery.StreamID,
+			next.Attempt, string(payload), now.Add(delay).UnixMilli(), errorCode, workerGroup).Int()
+	}
 	if err != nil {
 		return err
 	}
@@ -330,6 +539,9 @@ func (s *Store) PromoteRetries(ctx context.Context, limit int) (int, error) {
 }
 
 func (s *Store) Complete(ctx context.Context, lease Lease, reply message.OutboundMessage) error {
+	if s.config.SessionFencing == "strong" {
+		return ErrLeaseLost
+	}
 	if reply.Channel == "" {
 		reply.Channel = lease.Delivery.Task.Channel
 	}
@@ -360,6 +572,16 @@ func (s *Store) finish(ctx context.Context, lease Lease, result message.TaskResu
 		applied, err = completeScript.Run(ctx, s.client, []string{lease.InboxKey, s.replyStream, s.taskStream},
 			lease.Delivery.Task.TaskID, lease.Owner, lease.Epoch, lease.Delivery.StreamID,
 			string(payload), retention, workerGroup).Int()
+	} else if s.config.SessionFencing == "strong" {
+		now, timeErr := s.redisTime(ctx)
+		if timeErr != nil {
+			return timeErr
+		}
+		applied, err = failWithSessionScript.Run(ctx, s.client, []string{
+			lease.InboxKey, s.sessionLockKey(lease.SessionCoord), s.sessionStateKey(lease.SessionCoord),
+			s.replyStream, s.taskStream, s.sessionWaitKey,
+		}, lease.Delivery.Task.TaskID, lease.Owner, lease.Epoch, lease.Delivery.StreamID, lease.LockToken,
+			lease.SessionSeq, string(payload), errorCode, retention, workerGroup, now.UnixMilli(), lease.Delivery.Task.PayloadDigest).Int()
 	} else {
 		applied, err = failScript.Run(ctx, s.client, []string{lease.InboxKey, s.replyStream, s.taskStream},
 			lease.Delivery.Task.TaskID, lease.Owner, lease.Epoch, lease.Delivery.StreamID,
@@ -372,6 +594,22 @@ func (s *Store) finish(ctx context.Context, lease Lease, result message.TaskResu
 		return ErrKeyType
 	}
 	if applied != 1 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// ReleaseSessionLock is reserved for cancellation/shutdown cleanup. Normal
+// terminal transitions release the lock inside their own Lua script.
+func (s *Store) ReleaseSessionLock(ctx context.Context, lease Lease) error {
+	result, err := releaseSessionLockScript.Run(ctx, s.client, []string{s.sessionLockKey(lease.SessionCoord)}, lease.LockToken, lease.Delivery.Task.TaskID, lease.Epoch).Int()
+	if err != nil {
+		return err
+	}
+	if result == -9 {
+		return ErrKeyType
+	}
+	if result == 0 {
 		return ErrLeaseLost
 	}
 	return nil
@@ -390,6 +628,34 @@ func (s *Store) Reject(ctx context.Context, delivery Delivery, errorCode string)
 	}
 	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: snapshot.TaskID, ErrorCode: errorCode, TraceID: snapshot.TraceID}
 	payload, _ := json.Marshal(result)
+	if s.config.SessionFencing == "strong" && snapshot.SessionCoord != "" && snapshot.SessionSeq > 0 {
+		now, nowErr := s.redisTime(ctx)
+		if nowErr != nil {
+			return nowErr
+		}
+		applied, scriptErr := rejectWithSessionScript.Run(ctx, s.client, []string{
+			inboxKey, s.sessionStateKey(snapshot.SessionCoord), s.replyStream, s.taskStream, s.sessionWaitKey, s.sessionLockKey(snapshot.SessionCoord),
+		}, snapshot.TaskID, delivery.StreamID, errorCode, string(payload), workerGroup, int64(s.config.InboxRetention/time.Second), now.UnixMilli(), s.config.SessionWaitBackoff.Milliseconds(), s.config.SessionWaitMaxBackoff.Milliseconds(), snapshot.Digest, snapshot.SessionCoord, snapshot.SessionSeq, snapshot.Owner, snapshot.LeaseEpoch).Int()
+		if scriptErr != nil {
+			return scriptErr
+		}
+		if applied == -9 {
+			return ErrKeyType
+		}
+		if applied == -3 {
+			return ErrSessionLockActive
+		}
+		if applied == -4 {
+			return ErrLeaseLost
+		}
+		if applied == 3 {
+			return ErrSessionWait
+		}
+		if applied != 1 && applied != 2 {
+			return ErrLeaseLost
+		}
+		return nil
+	}
 	applied, err := rejectScript.Run(ctx, s.client, []string{inboxKey, s.replyStream, s.taskStream},
 		delivery.StreamID, string(payload), errorCode, int64(s.config.InboxRetention/time.Second), workerGroup).Int()
 	if err != nil {
@@ -406,6 +672,9 @@ func (s *Store) Reject(ctx context.Context, delivery Delivery, errorCode string)
 }
 
 func (s *Store) ClaimStale(ctx context.Context, consumer string, count int64) ([]Delivery, error) {
+	if s.config.SessionFencing == "strong" {
+		return s.scanStale(ctx, count)
+	}
 	messages, _, err := s.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
 		Stream: s.taskStream, Group: workerGroup, Consumer: consumer,
 		MinIdle: s.config.LeaseDuration, Start: "0-0", Count: count,
@@ -425,17 +694,97 @@ func (s *Store) ClaimStale(ctx context.Context, consumer string, count int64) ([
 	return deliveries, nil
 }
 
-func (s *Store) Recover(ctx context.Context, delivery Delivery) error {
+// scanStale reads stale Pending entries without changing their owner. Strong
+// Recover performs the ownership transfer only after it has checked the
+// Session lock inside recover_with_session.
+func (s *Store) scanStale(ctx context.Context, count int64) ([]Delivery, error) {
+	if count <= 0 {
+		count = 16
+	}
+	entries, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: s.taskStream, Group: workerGroup, Idle: s.config.LeaseDuration, Start: "-", End: "+", Count: count,
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]Delivery, 0, len(entries))
+	for _, pending := range entries {
+		messages, rangeErr := s.client.XRange(ctx, s.taskStream, pending.ID, pending.ID).Result()
+		if rangeErr != nil {
+			return nil, rangeErr
+		}
+		if len(messages) == 0 {
+			continue
+		}
+		delivery, decodeErr := decodeTaskMessage(messages[0])
+		delivery.PendingConsumer = pending.Consumer
+		delivery.PendingIdle = pending.Idle
+		if decodeErr != nil || delivery.Task.Validate() != nil || delivery.InboxID != delivery.Task.InboxID() {
+			_ = s.Reject(ctx, delivery, "invalid_task")
+			continue
+		}
+		result = append(result, delivery)
+	}
+	return result, nil
+}
+
+func (s *Store) Recover(ctx context.Context, delivery Delivery, currentConsumer ...string) error {
 	now, err := s.redisTime(ctx)
 	if err != nil {
 		return err
 	}
-	next := delivery.Task
-	next.Attempt++
-	nextPayload, _ := json.Marshal(next)
 	failed := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: delivery.Task.TaskID, ErrorCode: "worker_lost", TraceID: delivery.Task.TraceID}
 	failedPayload, _ := json.Marshal(failed)
 	inboxKey := s.inboxKey(delivery.InboxID)
+	consumer := delivery.PendingConsumer
+	if len(currentConsumer) > 0 && currentConsumer[0] != "" {
+		consumer = currentConsumer[0]
+	}
+	if consumer == "" {
+		consumer = "recovery"
+	}
+	if s.config.SessionFencing == "strong" {
+		snapshot, snapshotErr := s.snapshotByKey(ctx, inboxKey)
+		if snapshotErr != nil {
+			return snapshotErr
+		}
+		coord := snapshot.SessionCoord
+		if coord == "" {
+			return s.Reject(ctx, delivery, "quarantine_missing_session_coord")
+		}
+		next := delivery.Task
+		if snapshot.State == StateProcessing {
+			next.Attempt++
+		}
+		nextPayload, marshalErr := json.Marshal(next)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		result, scriptErr := recoverWithSessionScript.Run(ctx, s.client, []string{
+			inboxKey, s.sessionLockKey(coord), s.sessionStateKey(coord), s.replyStream, s.taskStream, s.sessionWaitKey,
+		}, delivery.Task.TaskID, delivery.StreamID, now.UnixMilli(), delivery.Task.Attempt, s.config.MaxAttempts,
+			int64(s.config.InboxRetention/time.Second), string(failedPayload), workerGroup, consumer,
+			delivery.Task.PayloadDigest, delivery.Task.Attempt, string(nextPayload)).Int()
+		if scriptErr != nil {
+			return scriptErr
+		}
+		switch result {
+		case -9:
+			return ErrKeyType
+		case -3:
+			return ErrSessionLockActive
+		case -4:
+			return ErrSessionWait
+		case -2:
+			return ErrLeaseLost
+		case -1:
+			return ErrLeaseLost
+		}
+		return nil
+	}
+	next := delivery.Task
+	next.Attempt++
+	nextPayload, _ := json.Marshal(next)
 	result, err := recoverScript.Run(ctx, s.client, []string{inboxKey, s.replyStream, s.taskStream},
 		delivery.Task.TaskID, delivery.StreamID, now.UnixMilli(), next.Attempt,
 		s.config.MaxAttempts, int64(s.config.InboxRetention/time.Second), string(failedPayload),
@@ -555,6 +904,26 @@ func (s *Store) backoff(attempt int) time.Duration {
 }
 
 func (s *Store) inboxKey(inboxID string) string { return s.inboxPrefix + inboxID }
+
+func (s *Store) sessionSeqKey(coord string) string {
+	return keyspace.SessionSequence(s.config.KeyPrefix, coord)
+}
+func (s *Store) sessionStateKey(coord string) string {
+	return keyspace.SessionState(s.config.KeyPrefix, coord)
+}
+func (s *Store) sessionLockKey(coord string) string {
+	return keyspace.SessionLock(s.config.KeyPrefix, coord)
+}
+
+func randomToken() string {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		// crypto/rand failures are exceptionally rare; a process-local fallback
+		// still preserves uniqueness for the current worker invocation.
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(token[:])
+}
 
 func validInboxID(value string) bool {
 	decoded, err := hex.DecodeString(value)

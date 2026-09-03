@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
 func TestLoadPlatformCatalog(t *testing.T) {
@@ -87,6 +89,55 @@ func TestPhase3ExampleConfigParses(t *testing.T) {
 	}
 	if cfg.Messaging == nil || len(cfg.Catalog.Tenants) != 2 {
 		t.Fatalf("unexpected Phase 3 config: %#v", cfg)
+	}
+}
+
+func TestPhase4ExampleConfigParses(t *testing.T) {
+	t.Setenv("IDENTITY_SECRET", strings.Repeat("i", 32))
+	t.Setenv("PHASE4_REDIS_URL", "localhost:6379")
+	t.Setenv("PHASE4_MODEL_KEY", "model-secret")
+	t.Setenv("PLATFORM_CONFIG_FILE", filepath.Join("..", "..", "configs", "phase4.example.json"))
+	cfg, err := LoadForRole(RoleServe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Messaging == nil || cfg.Messaging.SessionFencing != "strong" ||
+		cfg.Messaging.MaxTurnEvents != 512 || cfg.Messaging.MaxTurnBytes != 2<<20 ||
+		len(cfg.Catalog.StorageProfiles) != 1 || cfg.Catalog.StorageProfiles[0].Kind != tenant.StorageKindRedis {
+		t.Fatalf("unexpected Phase 4 config: %#v", cfg)
+	}
+}
+
+func TestMessagingTurnLimitsDefaultsAndJSONOverrides(t *testing.T) {
+	resolver := NewStaticCredentialResolver(map[string]string{"env:REDIS_URL": "redis://localhost:6379/0"})
+	defaults, err := parseMessagingFile(&messagingConfigFile{RedisCredentialRef: "env:REDIS_URL", KeyPrefix: "phase4-defaults"}, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.MaxTurnEvents != 512 || defaults.MaxTurnBytes != 2<<20 {
+		t.Fatalf("default turn limits=(%d,%d)", defaults.MaxTurnEvents, defaults.MaxTurnBytes)
+	}
+	overridden, err := parseMessagingFile(&messagingConfigFile{
+		RedisCredentialRef: "env:REDIS_URL", KeyPrefix: "phase4-overrides",
+		MaxTurnEvents: 7, MaxTurnBytes: 4096,
+	}, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overridden.MaxTurnEvents != 7 || overridden.MaxTurnBytes != 4096 {
+		t.Fatalf("overridden turn limits=(%d,%d)", overridden.MaxTurnEvents, overridden.MaxTurnBytes)
+	}
+}
+
+func TestMessagingTurnLimitsMustBePositive(t *testing.T) {
+	resolver := NewStaticCredentialResolver(map[string]string{"env:REDIS_URL": "redis://localhost:6379/0"})
+	for _, raw := range []*messagingConfigFile{
+		{RedisCredentialRef: "env:REDIS_URL", KeyPrefix: "phase4-invalid-events", MaxTurnEvents: -1},
+		{RedisCredentialRef: "env:REDIS_URL", KeyPrefix: "phase4-invalid-bytes", MaxTurnBytes: -1},
+	} {
+		if _, err := parseMessagingFile(raw, resolver); err == nil {
+			t.Fatalf("parseMessagingFile(%#v) unexpectedly succeeded", raw)
+		}
 	}
 }
 
