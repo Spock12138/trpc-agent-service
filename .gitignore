@@ -21,6 +21,9 @@ vendor/
 .stage15-cache/
 .stage15-spike/
 
+# Local Phase 5 dependency and test cache artifacts.
+.stage5-cache/
+
 # Local notes may contain credentials; never stage them.
 /这是一个伟大的开始.txt
 

@@ -149,7 +149,7 @@ cd trpc-agent-service
 ./start.sh
 ```
 
-需要修改监听地址时使用 `./start.sh -addr :8081`；脚本会将参数传给 `trpc-service serve`。
+服务默认只监听 `127.0.0.1:8080`。需要显式对外开放或修改端口时使用 `./start.sh -addr :8081`；脚本会将参数传给 `trpc-service serve`。
 
 Phase 2 也可以通过 `PLATFORM_CONFIG_FILE` 加载只读多租户目录。示例文件为 `configs/phase2.example.json`；先按实际环境修改模型 endpoint，并通过环境变量提供引用的凭据：
 
@@ -215,6 +215,39 @@ Strong 模式有以下硬约束：
 - task heartbeat 只续 task lease/Pending，Session heartbeat 只续 Session lock。
 
 完整 key schema、状态转换、恢复规则、测试矩阵和真实 Redis 7.4.11 验收见 [`docs/stage4-two-workers-session-lock.md`](docs/stage4-two-workers-session-lock.md)。Strong fencing 保护 Session/Inbox/Reply，不承诺模型、Tool、Memory 或外部系统副作用 exactly-once。
+
+### Phase 5 Telegram、企业微信智能机器人与 Web UI
+
+Phase 5 把 Telegram 长轮询、企业微信智能机器人 API 长连接和本地 Web UI 接入同一可靠链路。Telegram 使用 `github.com/go-telegram/bot v1.25.0`，由项目自行控制 `getUpdates` offset；企业微信使用官方 WebSocket 协议薄客户端，不再使用自建应用 callback、验签或消息解密。企微字段级 Spike 见 [`docs/stage5-wecom-spike.md`](docs/stage5-wecom-spike.md)。
+
+示例配置为 `configs/phase5.example.json`。所有真实值仍只通过环境变量注入：
+
+```bash
+export IDENTITY_SECRET='replace-with-at-least-32-random-bytes'
+export PLATFORM_CONFIG_FILE='configs/phase5.example.json'
+export PHASE5_REDIS_URL='redis://localhost:6379/0'
+export PHASE5_MODEL_KEY='replace-with-model-key'
+export PHASE5_TELEGRAM_TOKEN='replace-with-telegram-token'
+export PHASE5_WECOM_BOT_ID='replace-with-wecom-bot-id'
+export PHASE5_WECOM_BOT_SECRET='replace-with-wecom-bot-secret'
+
+./bin/trpc-service gateway -consumer gateway-a
+./bin/trpc-service worker -health-addr :8081 -consumer worker-a
+./bin/trpc-service worker -health-addr :8082 -consumer worker-b
+```
+
+Worker 不读取任何 IM 凭据。引用格式错误会拒绝启动；引用值缺失、认证失败或连接断开时进程保持存活，但 Gateway/serve 的 `/readyz` 返回 503。一个 Telegram/企微 Bot 首版只允许一个 Gateway 连接。
+
+Web UI 位于 `http://127.0.0.1:8080/`，使用预置 demo binding，不接受浏览器提交的 tenant/Agent/配置版本。异步接口为：
+
+```text
+POST /api/v1/web/messages
+GET  /api/v1/web/messages/{message_id}?binding_id=<demo-binding>
+```
+
+页面每 1500ms 轮询 `submitted/processing/succeeded/failed`。原同步 `POST /api/v1/demo/messages` 保持兼容。IM 首版只发一次性文本；Agent 失败向 IM 返回统一文案，Web 查询保留完整错误码。
+
+出站状态保存在 `<prefix>:reliable-v1:outbound:<task_id>`。发送成功或达到默认 5 次上限后，Lua 才原子更新终态并确认 Reply Stream；Gateway 重启会恢复 Pending 和 attempts。外部发送成功、Redis 确认前崩溃仍可能重复，因此只承诺至少一次。完整实现和验收矩阵见 [`docs/stage5-telegram-wecom-webui.md`](docs/stage5-telegram-wecom-webui.md)。
 
 停止服务：
 

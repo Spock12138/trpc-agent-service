@@ -2,7 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"testing"
+	"time"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
 func TestParseServeArgs(t *testing.T) {
@@ -13,7 +18,7 @@ func TestParseServeArgs(t *testing.T) {
 		wantHelp bool
 		wantErr  bool
 	}{
-		{name: "default address", wantAddr: ":8080"},
+		{name: "default address", wantAddr: "127.0.0.1:8080"},
 		{name: "override address", args: []string{"-addr", "127.0.0.1:9090"}, wantAddr: "127.0.0.1:9090"},
 		{name: "help", args: []string{"-h"}, wantHelp: true},
 		{name: "unexpected argument", args: []string{"extra"}, wantErr: true},
@@ -30,6 +35,49 @@ func TestParseServeArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewAdaptersKeepsMissingCredentialNotReady(t *testing.T) {
+	cfg := adapterTestConfig(t, []tenant.ChannelBinding{{
+		ID: "telegram-a", Channel: "telegram", ExternalAccountID: "123", CredentialRef: "env:TELEGRAM_A",
+		TenantID: "tenant-a", AgentAppID: "assistant", Enabled: true,
+	}}, map[string]string{"env:MODEL": "model-key"})
+	adapters, err := newAdapters(cfg)
+	if err != nil || len(adapters) != 1 {
+		t.Fatalf("newAdapters() = (%#v, %v)", adapters, err)
+	}
+	if err := adapters[0].Ready(context.Background()); err == nil {
+		t.Fatal("adapter with a missing credential reported ready")
+	}
+}
+
+func TestNewAdaptersRejectsDuplicateResolvedBot(t *testing.T) {
+	cfg := adapterTestConfig(t, []tenant.ChannelBinding{
+		{ID: "telegram-a", Channel: "telegram", ExternalAccountID: "123", CredentialRef: "env:TELEGRAM_A", TenantID: "tenant-a", AgentAppID: "assistant", Enabled: true},
+		{ID: "telegram-b", Channel: "telegram", ExternalAccountID: "456", CredentialRef: "env:TELEGRAM_B", TenantID: "tenant-a", AgentAppID: "assistant", Enabled: true},
+	}, map[string]string{"env:MODEL": "model-key", "env:TELEGRAM_A": "same-token", "env:TELEGRAM_B": "same-token"})
+	if _, err := newAdapters(cfg); err == nil {
+		t.Fatal("duplicate resolved Telegram bot was accepted")
+	}
+}
+
+func adapterTestConfig(t *testing.T, bindings []tenant.ChannelBinding, credentials map[string]string) config.Config {
+	t.Helper()
+	catalog := tenant.Catalog{
+		Tenants:         []tenant.Tenant{{ID: "tenant-a", Enabled: true}},
+		StorageProfiles: []tenant.StorageProfile{{TenantID: "tenant-a", ID: "memory", Kind: tenant.StorageKindInMemory}},
+		AgentApps:       []tenant.AgentApp{{TenantID: "tenant-a", ID: "assistant", Enabled: true, ActiveConfigVersion: "v1"}},
+		ConfigVersions: []tenant.ConfigVersion{{
+			TenantID: "tenant-a", AgentAppID: "assistant", Version: "v1", StorageProfileID: "memory", Instruction: "test",
+			Model: tenant.ModelConfig{Name: "model", BaseURL: "https://example.test", CredentialRef: "env:MODEL", RequestTimeout: time.Second, MaxOutputTokens: 32},
+		}},
+		ChannelBindings: bindings,
+	}
+	cfg, err := config.NewCatalogConfig(catalog, []byte("01234567890123456789012345678901"), config.NewStaticCredentialResolver(credentials))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
 }
 
 func TestParseGatewayAndWorkerArgs(t *testing.T) {

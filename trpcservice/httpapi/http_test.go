@@ -11,14 +11,39 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
 )
 
 type fakeBackend struct {
 	readyErr error
 	handle   func(context.Context, executor.Request) (executor.Reply, error)
+}
+
+type fakeAsyncBackend struct {
+	accepted message.InboundMessage
+	accept   func(message.InboundMessage) (channels.AcceptResult, error)
+	snapshot messaging.Snapshot
+	snapErr  error
+}
+
+func (f *fakeAsyncBackend) Ready(context.Context) error { return nil }
+func (f *fakeAsyncBackend) Handle(context.Context, message.InboundMessage) (message.OutboundMessage, error) {
+	return message.OutboundMessage{}, nil
+}
+func (f *fakeAsyncBackend) Accept(_ context.Context, inbound message.InboundMessage) (channels.AcceptResult, error) {
+	f.accepted = inbound
+	if f.accept != nil {
+		return f.accept(inbound)
+	}
+	return channels.AcceptResult{TaskID: "task", RequestID: inbound.RequestID, TraceID: inbound.TraceID}, nil
+}
+func (f *fakeAsyncBackend) Snapshot(context.Context, string, string, string) (messaging.Snapshot, error) {
+	return f.snapshot, f.snapErr
 }
 
 func (f fakeBackend) Ready(context.Context) error { return f.readyErr }
@@ -175,6 +200,106 @@ func TestReadyEndpoint(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}
+
+func TestWebMessageSubmitUsesTrustedDemoChannel(t *testing.T) {
+	backend := &fakeAsyncBackend{}
+	handler := NewHandler(backend)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/web/messages", strings.NewReader(`{"binding_id":"custom-demo","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if backend.accepted.Channel != "demo" || backend.accepted.BindingID != "custom-demo" || backend.accepted.ConversationType != message.ConversationDirect || backend.accepted.RequestID == "" || backend.accepted.TraceID == "" {
+		t.Fatalf("accepted web message = %#v", backend.accepted)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["submitted"] != true || body["message_id"] != "m1" {
+		t.Fatalf("response = %#v, error=%v", body, err)
+	}
+
+	backend.accept = func(inbound message.InboundMessage) (channels.AcceptResult, error) {
+		return channels.AcceptResult{RequestID: inbound.RequestID, TraceID: inbound.TraceID, Terminal: true}, nil
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/web/messages", strings.NewReader(`{"binding_id":"custom-demo","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("terminal duplicate status = %d", rec.Code)
+	}
+}
+
+func TestWebMessageSubmitRejectsUntrustedAndMultipleFields(t *testing.T) {
+	handler := NewHandler(&fakeAsyncBackend{})
+	for _, payload := range []string{
+		`{"binding_id":"demo","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello","tenant_id":"forged"}`,
+		`{"binding_id":"demo","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"} {}`,
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/web/messages", strings.NewReader(payload)))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("payload %q status = %d", payload, rec.Code)
+		}
+	}
+
+	backend := &fakeAsyncBackend{accept: func(message.InboundMessage) (channels.AcceptResult, error) {
+		return channels.AcceptResult{}, executor.ErrUnknownBinding
+	}}
+	rec := httptest.NewRecorder()
+	NewHandler(backend).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/web/messages", strings.NewReader(`{"binding_id":"missing","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`)))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown binding status = %d", rec.Code)
+	}
+}
+
+func TestWebSnapshotStatusAndErrorProjection(t *testing.T) {
+	tests := []struct {
+		name       string
+		snapshot   messaging.Snapshot
+		wantStatus string
+		wantText   string
+		wantError  string
+	}{
+		{name: "submitted", snapshot: messaging.Snapshot{State: messaging.StateQueued, RequestID: "request", TraceID: "trace"}, wantStatus: "submitted"},
+		{name: "processing", snapshot: messaging.Snapshot{State: messaging.StateRetryWait, RequestID: "request", TraceID: "trace"}, wantStatus: "processing"},
+		{name: "succeeded", snapshot: messaging.Snapshot{State: messaging.StateSucceeded, RequestID: "request", TraceID: "trace", Result: &message.TaskResult{Succeeded: true, Reply: message.OutboundMessage{Text: "answer"}}}, wantStatus: "succeeded", wantText: "answer"},
+		{name: "failed", snapshot: messaging.Snapshot{State: messaging.StateFailedTerminal, RequestID: "request", TraceID: "trace", Result: &message.TaskResult{ErrorCode: "model_timeout"}}, wantStatus: "failed", wantError: "model_timeout"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := NewHandler(&fakeAsyncBackend{snapshot: test.snapshot})
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/web/messages/m1?binding_id=custom-demo", nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["status"] != test.wantStatus || body["request_id"] != "request" || body["trace_id"] != "trace" {
+				t.Fatalf("snapshot response = %#v, error=%v", body, err)
+			}
+			if test.wantText != "" && body["text"] != test.wantText {
+				t.Fatalf("text = %#v", body["text"])
+			}
+			if test.wantError != "" && body["error_code"] != test.wantError {
+				t.Fatalf("error_code = %#v", body["error_code"])
+			}
+		})
+	}
+
+	backend := &fakeAsyncBackend{snapErr: executor.ErrUnknownBinding}
+	rec := httptest.NewRecorder()
+	NewHandler(backend).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/web/messages/m1?binding_id=missing", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown binding GET status = %d", rec.Code)
+	}
+}
+
+func TestEmbeddedWebUIUsesConfiguredBindingAndPolling(t *testing.T) {
+	rec := httptest.NewRecorder()
+	NewHandler(&fakeAsyncBackend{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "binding_id:fields.binding.value") || !strings.Contains(rec.Body.String(), "},1500)") {
+		t.Fatalf("embedded UI response status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
