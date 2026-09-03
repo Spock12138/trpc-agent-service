@@ -163,6 +163,20 @@ func (c Config) RoutingCatalog() (tenant.Catalog, error) {
 	return catalog, nil
 }
 
+// GatewayCatalog resolves only credentials owned by Gateway adapters. Worker
+// startup deliberately uses RuntimeCatalog and never calls this method.
+func (c Config) GatewayCatalog() (tenant.Catalog, CredentialResolver, error) {
+	catalog, err := c.RoutingCatalog()
+	if err != nil {
+		return tenant.Catalog{}, nil, err
+	}
+	resolver := c.credentials
+	if resolver == nil {
+		resolver = envCredentialResolver{}
+	}
+	return catalog, resolver, nil
+}
+
 func NewCatalogConfig(catalog tenant.Catalog, identitySecret []byte, resolver CredentialResolver) (Config, error) {
 	if len(identitySecret) < MinIdentitySecretLen {
 		return Config{}, fmt.Errorf("IDENTITY_SECRET must be at least %d bytes", MinIdentitySecretLen)
@@ -446,6 +460,16 @@ func loadPlatformFile(path string) (tenant.Catalog, *messagingConfigFile, error)
 			}
 		}
 	}
+	for _, binding := range catalog.ChannelBindings {
+		for _, ref := range []string{binding.CredentialRef, binding.BotIDRef, binding.BotSecretRef} {
+			if ref == "" {
+				continue
+			}
+			if _, err := envNameFromCredentialRef(ref); err != nil {
+				return tenant.Catalog{}, nil, err
+			}
+		}
+	}
 	return catalog, raw.Messaging, nil
 }
 
@@ -481,6 +505,31 @@ func validateCatalogCredentials(catalog tenant.Catalog, resolver CredentialResol
 				return errors.New("storage credential for enabled config is not a valid Redis URL")
 			}
 			checkedProfiles[profileKey] = true
+		}
+	}
+	return nil
+}
+
+func validateChannelCredentials(catalog tenant.Catalog, resolver CredentialResolver) error {
+	enabledTenants := make(map[string]bool, len(catalog.Tenants))
+	enabledApps := make(map[string]bool, len(catalog.AgentApps))
+	for _, current := range catalog.Tenants {
+		enabledTenants[current.ID] = current.Enabled
+	}
+	for _, current := range catalog.AgentApps {
+		enabledApps[current.TenantID+"\x00"+current.ID] = current.Enabled && enabledTenants[current.TenantID]
+	}
+	for _, binding := range catalog.ChannelBindings {
+		if !binding.Enabled || !enabledApps[binding.TenantID+"\x00"+binding.AgentAppID] {
+			continue
+		}
+		for _, ref := range []string{binding.CredentialRef, binding.BotIDRef, binding.BotSecretRef} {
+			if ref == "" {
+				continue
+			}
+			if _, err := resolver.Resolve(ref); err != nil {
+				return errors.New("IM credential unavailable for enabled binding")
+			}
 		}
 	}
 	return nil

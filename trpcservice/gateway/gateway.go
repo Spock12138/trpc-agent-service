@@ -5,12 +5,15 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
@@ -18,7 +21,7 @@ import (
 )
 
 var (
-	ErrMessageConflict      = errors.New("message idempotency conflict")
+	ErrMessageConflict      = channels.ErrIngressConflict
 	ErrTaskPending          = errors.New("task is still processing")
 	ErrMessagingUnavailable = errors.New("messaging dependency unavailable")
 )
@@ -28,20 +31,81 @@ type Service struct {
 	store    *messaging.Store
 	consumer string
 
-	running atomic.Bool
-	mu      sync.Mutex
-	waiters map[string][]chan struct{}
-	cancel  context.CancelFunc
+	running  atomic.Bool
+	mu       sync.Mutex
+	waiters  map[string][]chan struct{}
+	cancel   context.CancelFunc
+	adapters map[string]channels.Adapter
+	queues   map[string]chan messaging.ReplyDelivery
+	loops    sync.WaitGroup
+}
+
+const agentFailureText = "抱歉，处理失败，请稍后重试。"
+
+// Accept is the asynchronous ingress contract used by IM adapters. It waits
+// only for the Inbox and task stream durable write, never for Agent execution.
+func (s *Service) Accept(ctx context.Context, inbound message.InboundMessage) (channels.AcceptResult, error) {
+	task, err := s.router.Resolve(ctx, inbound)
+	if err != nil {
+		switch {
+		case errors.Is(err, routing.ErrUnknownBinding):
+			return channels.AcceptResult{}, executor.ErrUnknownBinding
+		case errors.Is(err, routing.ErrConfigurationUnavailable):
+			return channels.AcceptResult{}, executor.ErrConfigurationUnavailable
+		default:
+			return channels.AcceptResult{}, err
+		}
+	}
+	snapshot, created, err := s.store.Submit(ctx, task)
+	if err != nil {
+		if errors.Is(err, messaging.ErrConflict) {
+			return channels.AcceptResult{RequestID: task.RequestID, TraceID: task.TraceID}, ErrMessageConflict
+		}
+		return channels.AcceptResult{RequestID: task.RequestID, TraceID: task.TraceID}, ErrMessagingUnavailable
+	}
+	return channels.AcceptResult{
+		TaskID: snapshot.TaskID, RequestID: task.RequestID, TraceID: snapshot.TraceID,
+		Duplicate: !created, Terminal: snapshot.Terminal(),
+	}, nil
+}
+
+func (s *Service) Snapshot(ctx context.Context, channel, bindingID, platformMessageID string) (messaging.Snapshot, error) {
+	inboxID, err := s.router.InboxID(ctx, channel, bindingID, platformMessageID)
+	if err != nil {
+		if errors.Is(err, routing.ErrUnknownBinding) {
+			return messaging.Snapshot{}, executor.ErrUnknownBinding
+		}
+		return messaging.Snapshot{}, executor.ErrConfigurationUnavailable
+	}
+	return s.store.Snapshot(ctx, inboxID)
 }
 
 func New(router *routing.Router, store *messaging.Store, consumer string) (*Service, error) {
+	return NewWithAdapters(router, store, consumer)
+}
+
+func NewWithAdapters(router *routing.Router, store *messaging.Store, consumer string, adapters ...channels.Adapter) (*Service, error) {
 	if router == nil || store == nil {
 		return nil, errors.New("router and messaging store are required")
 	}
 	if consumer == "" {
 		return nil, errors.New("gateway consumer name is required")
 	}
-	return &Service{router: router, store: store, consumer: consumer, waiters: make(map[string][]chan struct{})}, nil
+	service := &Service{
+		router: router, store: store, consumer: consumer, waiters: make(map[string][]chan struct{}),
+		adapters: make(map[string]channels.Adapter, len(adapters)), queues: make(map[string]chan messaging.ReplyDelivery, len(adapters)),
+	}
+	for _, adapter := range adapters {
+		if adapter == nil || adapter.Name() == "" {
+			return nil, errors.New("channel adapter and name are required")
+		}
+		if _, exists := service.adapters[adapter.Name()]; exists {
+			return nil, fmt.Errorf("duplicate channel adapter %q", adapter.Name())
+		}
+		service.adapters[adapter.Name()] = adapter
+		service.queues[adapter.Name()] = make(chan messaging.ReplyDelivery, 64)
+	}
+	return service, nil
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -67,12 +131,35 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.store.Ready(runCtx); err != nil {
 		return err
 	}
+	adapterErrors := make(chan error, len(s.adapters))
+	for name, adapter := range s.adapters {
+		queue := s.queues[name]
+		s.loops.Add(2)
+		go func(current channels.Adapter) {
+			defer s.loops.Done()
+			if err := current.Start(runCtx, s); err != nil && runCtx.Err() == nil {
+				select {
+				case adapterErrors <- err:
+				default:
+				}
+			}
+		}(adapter)
+		go func(current channels.Adapter, deliveries <-chan messaging.ReplyDelivery) {
+			defer s.loops.Done()
+			s.deliveryLoop(runCtx, current, deliveries)
+		}(adapter, queue)
+	}
 	s.running.Store(true)
 	for {
 		if runCtx.Err() != nil {
 			return nil
 		}
-		claimed, err := s.store.ClaimReplies(runCtx, s.consumer, 5*time.Second, 16)
+		select {
+		case err := <-adapterErrors:
+			return err
+		default:
+		}
+		claimed, err := s.store.ClaimReplies(runCtx, s.consumer, outboundClaimIdle(s.store.Config()), 16)
 		if err == nil {
 			for _, reply := range claimed {
 				s.deliver(runCtx, reply)
@@ -101,7 +188,92 @@ func (s *Service) deliver(ctx context.Context, delivery messaging.ReplyDelivery)
 	for _, waiter := range waiters {
 		close(waiter)
 	}
-	_ = s.store.AckReply(ctx, delivery.StreamID)
+	if !delivery.Result.Target.Valid() || delivery.Result.Target.Channel == "demo" {
+		_ = s.store.AckReply(ctx, delivery.StreamID)
+		return
+	}
+	queue := s.queues[delivery.Result.Target.ChannelBindingID]
+	if queue == nil {
+		return
+	}
+	select {
+	case queue <- delivery:
+	default:
+		// Leave the reply Pending; reclaim will retry without blocking other bindings.
+	}
+}
+
+func (s *Service) deliveryLoop(ctx context.Context, adapter channels.Adapter, deliveries <-chan messaging.ReplyDelivery) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case delivery := <-deliveries:
+			s.deliverOne(ctx, adapter, delivery)
+		}
+	}
+}
+
+func (s *Service) deliverOne(ctx context.Context, adapter channels.Adapter, delivery messaging.ReplyDelivery) {
+	timeout := outboundSendTimeout(s.store.Config())
+	for ctx.Err() == nil {
+		state, err := s.store.BeginOutbound(ctx, delivery)
+		if errors.Is(err, messaging.ErrOutboundDeferred) {
+			if !waitUntil(ctx, state.NextAttemptAt) {
+				return
+			}
+			continue
+		}
+		if errors.Is(err, messaging.ErrTerminal) {
+			_ = s.store.AckReply(ctx, delivery.StreamID)
+			return
+		}
+		if err != nil {
+			if !waitUntil(ctx, time.Now().Add(100*time.Millisecond)) {
+				return
+			}
+			continue
+		}
+		reply := delivery.Result.Target.Apply(delivery.Result.Reply)
+		if !delivery.Result.Succeeded {
+			reply.Text = agentFailureText
+			reply.TraceID = ""
+			reply.RequestID = ""
+			reply.SessionID = ""
+		}
+		sendCtx, cancel := context.WithTimeout(ctx, timeout)
+		sendErr := adapter.Send(sendCtx, reply)
+		cancel()
+		transitionCtx, transitionCancel := context.WithTimeout(context.Background(), timeout)
+		if sendErr == nil {
+			err = s.store.CompleteOutbound(transitionCtx, delivery)
+			transitionCancel()
+			if err == nil {
+				return
+			}
+			continue
+		}
+		terminal, retryErr := s.store.RetryOutbound(transitionCtx, delivery, state, "send_failed")
+		transitionCancel()
+		if retryErr == nil && terminal {
+			return
+		}
+	}
+}
+
+func waitUntil(ctx context.Context, target time.Time) bool {
+	delay := time.Until(target)
+	if delay < 0 {
+		delay = 0
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (s *Service) Handle(ctx context.Context, inbound message.InboundMessage) (message.OutboundMessage, error) {
@@ -202,7 +374,15 @@ func (s *Service) Ready(ctx context.Context) error {
 	if !s.running.Load() {
 		return errors.New("gateway reply consumer is not running")
 	}
-	return s.store.Ready(ctx)
+	if err := s.store.Ready(ctx); err != nil {
+		return err
+	}
+	for _, adapter := range s.adapters {
+		if err := adapter.Ready(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) Close() error {
@@ -212,5 +392,24 @@ func (s *Service) Close() error {
 	if cancel != nil {
 		cancel()
 	}
-	return nil
+	var result error
+	for _, adapter := range s.adapters {
+		result = errors.Join(result, adapter.Close())
+	}
+	s.loops.Wait()
+	return result
+}
+
+func outboundSendTimeout(cfg config.MessagingConfig) time.Duration {
+	if cfg.OutboundSendTimeout == 0 {
+		return config.DefaultOutboundSendTimeout
+	}
+	return cfg.OutboundSendTimeout
+}
+
+func outboundClaimIdle(cfg config.MessagingConfig) time.Duration {
+	if cfg.OutboundClaimIdle == 0 {
+		return config.DefaultOutboundClaimIdle
+	}
+	return cfg.OutboundClaimIdle
 }

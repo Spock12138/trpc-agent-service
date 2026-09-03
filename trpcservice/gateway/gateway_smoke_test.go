@@ -124,6 +124,68 @@ func TestRedis7GatewayWorkerRuntimeSmoke(t *testing.T) {
 	}
 }
 
+func TestRedis7Phase5OutboundRecoverySmoke(t *testing.T) {
+	rawURL := os.Getenv("PHASE5_REDIS_SMOKE_URL")
+	if rawURL == "" {
+		t.Skip("PHASE5_REDIS_SMOKE_URL is not set")
+	}
+	redisURL, err := config.NormalizeRedisURL(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := fmt.Sprintf("phase5-outbound-smoke:%d", time.Now().UnixNano())
+	store, err := messaging.NewStore(config.MessagingConfig{
+		RedisURL: redisURL, KeyPrefix: prefix,
+		LeaseDuration: time.Second, HeartbeatInterval: 100 * time.Millisecond,
+		InitialBackoff: 20 * time.Millisecond, MaxBackoff: 100 * time.Millisecond, MaxAttempts: 3,
+		InboxRetention: time.Minute, ReplyWaitTimeout: time.Second,
+		OutboundMaxAttempts: 5, OutboundInitialBackoff: 300 * time.Millisecond, OutboundMaxBackoff: 300 * time.Millisecond,
+		OutboundSendTimeout: 100 * time.Millisecond, OutboundClaimIdle: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	defer newRedisCleanup(t, redisURL, prefix+":reliable-v1:*")()
+	catalog := gatewayCatalog()
+	catalog.ChannelBindings[0] = tenant.ChannelBinding{
+		ID: "telegram-binding", Channel: "telegram", ExternalAccountID: "123", CredentialRef: "env:TELEGRAM_TOKEN",
+		TenantID: "tenant", AgentAppID: "app", Enabled: true,
+	}
+	repository, err := tenant.NewPresetRepository(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := routing.New(repository, []byte("01234567890123456789012345678901"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstAdapter := &recordingAdapter{name: "telegram-binding", failFor: 100}
+	first, cancelFirst, firstDone := startGatewayWithAdapter(t, store, router, "phase5-smoke-first", firstAdapter)
+	task := submitAndFinishIMTask(t, first, store, "phase5-restart", true)
+	waitOutboundAttempts(t, store, task.TaskID, 1)
+	cancelFirst()
+	_ = first.Close()
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(75 * time.Millisecond)
+	secondAdapter := &recordingAdapter{name: "telegram-binding"}
+	second, cancelSecond, secondDone := startGatewayWithAdapter(t, store, router, "phase5-smoke-second", secondAdapter)
+	state := waitOutboundTerminal(t, store, task.TaskID)
+	cancelSecond()
+	_ = second.Close()
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	secondAttempts, _ := secondAdapter.snapshot()
+	if state.Status != "succeeded" || state.Attempts != 2 || secondAttempts != 1 {
+		t.Fatalf("real Redis recovered outbound state=%#v second attempts=%d", state, secondAttempts)
+	}
+}
+
 func waitForSmokeReady(t *testing.T, gatewayService *Service, workerService *worker.Worker) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

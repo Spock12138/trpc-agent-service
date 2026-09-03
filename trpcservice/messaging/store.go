@@ -55,6 +55,7 @@ type Snapshot struct {
 	State        string
 	Attempt      int
 	TraceID      string
+	RequestID    string
 	ErrorCode    string
 	Result       *message.TaskResult
 	RawPayload   string
@@ -240,13 +241,19 @@ func (s *Store) snapshotByKey(ctx context.Context, inboxKey string) (Snapshot, e
 	}
 	snapshot := Snapshot{
 		InboxKey: inboxKey, TaskID: values["task_id"], Digest: values["digest"],
-		State: values["state"], TraceID: values["trace_id"], ErrorCode: values["error_code"],
+		State: values["state"], TraceID: values["trace_id"], ErrorCode: values["error_code"], RequestID: values["request_id"],
 		RawPayload: values["payload"], SessionCoord: values["session_coord"], Owner: values["owner"],
 	}
 	snapshot.Attempt, _ = strconv.Atoi(values["attempt"])
 	snapshot.SessionSeq, _ = strconv.ParseInt(values["session_seq"], 10, 64)
 	snapshot.LeaseEpoch, _ = strconv.ParseInt(values["lease_epoch"], 10, 64)
 	snapshot.LeaseUntil, _ = strconv.ParseInt(values["lease_until"], 10, 64)
+	if snapshot.RawPayload != "" {
+		var storedTask message.ExecutionTask
+		if decodeStrictJSON(snapshot.RawPayload, &storedTask) == nil {
+			snapshot.RequestID = storedTask.RequestID
+		}
+	}
 	if raw := values["result"]; raw != "" {
 		var result message.TaskResult
 		if err := decodeStrictJSON(raw, &result); err != nil {
@@ -542,22 +549,25 @@ func (s *Store) Complete(ctx context.Context, lease Lease, reply message.Outboun
 	if s.config.SessionFencing == "strong" {
 		return ErrLeaseLost
 	}
-	if reply.Channel == "" {
-		reply.Channel = lease.Delivery.Task.Channel
-	}
-	if reply.BindingID == "" {
-		reply.BindingID = lease.Delivery.Task.ChannelBindingID
-	}
+	target := lease.Delivery.Task.DeliveryTarget()
+	reply = target.Apply(reply)
 	result := message.TaskResult{
 		SchemaVersion: message.TaskSchemaVersion, TaskID: lease.Delivery.Task.TaskID, Succeeded: true,
-		Channel: reply.Channel, BindingID: reply.BindingID, Reply: reply,
+		Channel: target.Channel, BindingID: target.ChannelBindingID, Reply: reply,
 		TraceID: lease.Delivery.Task.TraceID,
+	}
+	if target.Valid() {
+		result.Target = target
 	}
 	return s.finish(ctx, lease, result, "")
 }
 
 func (s *Store) Fail(ctx context.Context, lease Lease, errorCode string) error {
-	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: lease.Delivery.Task.TaskID, ErrorCode: errorCode, TraceID: lease.Delivery.Task.TraceID}
+	target := lease.Delivery.Task.DeliveryTarget()
+	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: lease.Delivery.Task.TaskID, Channel: target.Channel, BindingID: target.ChannelBindingID, ErrorCode: errorCode, TraceID: lease.Delivery.Task.TraceID}
+	if target.Valid() {
+		result.Target = target
+	}
 	return s.finish(ctx, lease, result, errorCode)
 }
 
@@ -733,7 +743,11 @@ func (s *Store) Recover(ctx context.Context, delivery Delivery, currentConsumer 
 	if err != nil {
 		return err
 	}
-	failed := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: delivery.Task.TaskID, ErrorCode: "worker_lost", TraceID: delivery.Task.TraceID}
+	target := delivery.Task.DeliveryTarget()
+	failed := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: delivery.Task.TaskID, Channel: target.Channel, BindingID: target.ChannelBindingID, ErrorCode: "worker_lost", TraceID: delivery.Task.TraceID}
+	if target.Valid() {
+		failed.Target = target
+	}
 	failedPayload, _ := json.Marshal(failed)
 	inboxKey := s.inboxKey(delivery.InboxID)
 	consumer := delivery.PendingConsumer

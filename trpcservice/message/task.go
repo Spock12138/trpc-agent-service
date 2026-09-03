@@ -12,36 +12,43 @@ import (
 )
 
 const (
-	TaskSchemaVersion = 1
+	TaskSchemaVersion = 2
 	maxTaskIDBytes    = 512
 	maxTaskTextBytes  = 16 << 10
 )
 
 type ExecutionTask struct {
-	SchemaVersion     int       `json:"schema_version"`
-	TaskID            string    `json:"task_id"`
-	Channel           string    `json:"channel"`
-	ChannelBindingID  string    `json:"channel_binding_id"`
-	TenantID          string    `json:"tenant_id"`
-	AgentAppID        string    `json:"agent_app_id"`
-	ConfigVersion     string    `json:"config_version"`
-	RunnerUserID      string    `json:"runner_user_id"`
-	SessionID         string    `json:"session_id"`
-	PlatformMessageID string    `json:"platform_message_id"`
-	Text              string    `json:"text"`
-	RequestID         string    `json:"request_id"`
-	TraceID           string    `json:"trace_id"`
-	ReceivedAt        time.Time `json:"received_at"`
-	Attempt           int       `json:"attempt"`
-	PayloadDigest     string    `json:"payload_digest"`
+	SchemaVersion     int              `json:"schema_version"`
+	TaskID            string           `json:"task_id"`
+	Channel           string           `json:"channel"`
+	ChannelBindingID  string           `json:"channel_binding_id"`
+	ExternalAccountID string           `json:"external_account_id"`
+	TenantID          string           `json:"tenant_id"`
+	AgentAppID        string           `json:"agent_app_id"`
+	ConfigVersion     string           `json:"config_version"`
+	RunnerUserID      string           `json:"runner_user_id"`
+	SessionID         string           `json:"session_id"`
+	PlatformMessageID string           `json:"platform_message_id"`
+	ActorUserID       string           `json:"actor_user_id"`
+	ConversationID    string           `json:"conversation_id"`
+	ConversationType  ConversationType `json:"conversation_type"`
+	ReplyToMessageID  string           `json:"reply_to_message_id,omitempty"`
+	PlatformRequestID string           `json:"platform_request_id,omitempty"`
+	Text              string           `json:"text"`
+	RequestID         string           `json:"request_id"`
+	TraceID           string           `json:"trace_id"`
+	ReceivedAt        time.Time        `json:"received_at"`
+	Attempt           int              `json:"attempt"`
+	PayloadDigest     string           `json:"payload_digest"`
 }
 
 type TaskResult struct {
 	SchemaVersion int             `json:"schema_version"`
 	TaskID        string          `json:"task_id"`
 	Succeeded     bool            `json:"succeeded"`
-	Channel       string          `json:"channel,omitempty"`
-	BindingID     string          `json:"binding_id,omitempty"`
+	Channel       string          `json:"channel,omitempty"`    // Legacy projection of Target.
+	BindingID     string          `json:"binding_id,omitempty"` // Legacy projection of Target.
+	Target        DeliveryTarget  `json:"target,omitempty"`
 	Reply         OutboundMessage `json:"reply,omitempty"`
 	ErrorCode     string          `json:"error_code,omitempty"`
 	TraceID       string          `json:"trace_id"`
@@ -58,6 +65,14 @@ func (r TaskResult) Validate() error {
 	} else if r.ErrorCode == "" {
 		return errors.New("failed task result error_code is missing")
 	}
+	if r.Target != (DeliveryTarget{}) {
+		if !r.Target.Valid() {
+			return errors.New("task result delivery target is invalid")
+		}
+		if r.Channel != r.Target.Channel || r.BindingID != r.Target.ChannelBindingID {
+			return errors.New("task result delivery target does not match projection")
+		}
+	}
 	return nil
 }
 
@@ -65,16 +80,30 @@ func (t ExecutionTask) InboxID() string {
 	return digestParts(t.TenantID, t.ChannelBindingID, t.PlatformMessageID)
 }
 
+func (t ExecutionTask) DeliveryTarget() DeliveryTarget {
+	return DeliveryTarget{
+		Channel: t.Channel, ChannelBindingID: t.ChannelBindingID, ExternalAccountID: t.ExternalAccountID,
+		ConversationID: t.ConversationID, ConversationType: t.ConversationType,
+		ReplyToMessageID: t.ReplyToMessageID, PlatformRequestID: t.PlatformRequestID,
+	}
+}
+
 func (t ExecutionTask) CanonicalDigest() string {
 	return digestParts(
 		t.Channel,
 		t.ChannelBindingID,
+		t.ExternalAccountID,
 		t.PlatformMessageID,
 		t.TenantID,
 		t.AgentAppID,
 		t.ConfigVersion,
 		t.RunnerUserID,
 		t.SessionID,
+		t.ActorUserID,
+		t.ConversationID,
+		string(t.ConversationType),
+		t.ReplyToMessageID,
+		t.PlatformRequestID,
 		t.Text,
 	)
 }
@@ -100,9 +129,9 @@ func (t ExecutionTask) Validate() error {
 		return errors.New("unsupported task schema_version")
 	}
 	for _, value := range []string{
-		t.TaskID, t.Channel, t.ChannelBindingID, t.TenantID, t.AgentAppID,
+		t.TaskID, t.Channel, t.ChannelBindingID, t.ExternalAccountID, t.TenantID, t.AgentAppID,
 		t.ConfigVersion, t.RunnerUserID, t.SessionID, t.PlatformMessageID,
-		t.RequestID, t.TraceID,
+		t.ActorUserID, t.ConversationID, t.RequestID, t.TraceID,
 	} {
 		if value == "" || len(value) > maxTaskIDBytes {
 			return errors.New("task contains a missing or oversized identifier")
@@ -110,6 +139,9 @@ func (t ExecutionTask) Validate() error {
 	}
 	if strings.TrimSpace(t.Text) == "" || len(t.Text) > maxTaskTextBytes {
 		return errors.New("task text is missing or oversized")
+	}
+	if !t.ConversationType.Valid() {
+		return errors.New("task conversation_type is invalid")
 	}
 	if t.ReceivedAt.IsZero() || t.Attempt < 1 {
 		return errors.New("task metadata is invalid")

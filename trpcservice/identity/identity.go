@@ -29,6 +29,10 @@ func GroupRunnerUserID(secret []byte, bindingID, conversationID string) string {
 	return "g_" + Derive(secret, bindingID, "group", conversationID)
 }
 
+func GroupSessionID(secret []byte, bindingID, conversationID string) string {
+	return "s_" + Derive(secret, bindingID, "group", conversationID)
+}
+
 func TraceID() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {

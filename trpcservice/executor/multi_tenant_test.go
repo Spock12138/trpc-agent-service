@@ -318,9 +318,10 @@ func TestRuntimeExecuteUsesTaskConfigVersionAfterActiveVersionChanges(t *testing
 	defer runtime.Close()
 
 	task := message.ExecutionTask{
-		SchemaVersion: message.TaskSchemaVersion, TaskID: "task-fixed-v1", Channel: "demo", ChannelBindingID: "binding-a",
+		SchemaVersion: message.TaskSchemaVersion, TaskID: "task-fixed-v1", Channel: "demo", ChannelBindingID: "binding-a", ExternalAccountID: "demo-account",
 		TenantID: "tenant-a", AgentAppID: "assistant", ConfigVersion: "v1", RunnerUserID: "user-fixed", SessionID: "session-fixed",
-		PlatformMessageID: "message-fixed", Text: "hello", RequestID: "request-fixed", TraceID: "trace-fixed",
+		PlatformMessageID: "message-fixed", ActorUserID: "actor-fixed", ConversationID: "conversation-fixed", ConversationType: message.ConversationDirect,
+		Text: "hello", RequestID: "request-fixed", TraceID: "trace-fixed",
 		ReceivedAt: time.Now().UTC(), Attempt: 1,
 	}
 	task.PayloadDigest = task.CanonicalDigest()

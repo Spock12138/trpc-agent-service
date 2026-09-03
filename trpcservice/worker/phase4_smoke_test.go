@@ -166,9 +166,10 @@ func TestRedis7Phase4TwoWorkersSmoke(t *testing.T) {
 
 func phase4SmokeTask(taskID, messageID, sessionID string) message.ExecutionTask {
 	task := message.ExecutionTask{
-		SchemaVersion: message.TaskSchemaVersion, TaskID: taskID, Channel: "demo", ChannelBindingID: "binding-a",
+		SchemaVersion: message.TaskSchemaVersion, TaskID: taskID, Channel: "demo", ChannelBindingID: "binding-a", ExternalAccountID: "demo-account",
 		TenantID: "tenant-a", AgentAppID: "assistant", ConfigVersion: "v1", RunnerUserID: "user-a",
-		SessionID: sessionID, PlatformMessageID: messageID, Text: "hello", RequestID: taskID + "-request",
+		SessionID: sessionID, PlatformMessageID: messageID, ActorUserID: "actor-a", ConversationID: sessionID,
+		ConversationType: message.ConversationDirect, Text: "hello", RequestID: taskID + "-request",
 		TraceID: taskID + "-trace", ReceivedAt: time.Now().UTC(), Attempt: 1,
 	}
 	task.PayloadDigest = task.CanonicalDigest()

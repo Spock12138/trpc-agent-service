@@ -16,47 +16,57 @@ const (
 )
 
 const (
-	DefaultMessagingPrefix       = "trpc-agent-service:phase3"
-	DefaultLeaseDuration         = 30 * time.Second
-	DefaultHeartbeatInterval     = 10 * time.Second
-	DefaultInitialBackoff        = time.Second
-	DefaultMaxBackoff            = 30 * time.Second
-	DefaultMaxAttempts           = 3
-	DefaultInboxRetention        = 24 * time.Hour
-	DefaultReplyWaitTimeout      = 75 * time.Second
-	DefaultSessionFencing        = "legacy"
-	DefaultSessionLockDuration   = DefaultLeaseDuration
-	DefaultSessionWaitBackoff    = 100 * time.Millisecond
-	DefaultSessionWaitMaxBackoff = 2 * time.Second
-	DefaultMaxTurnEvents         = 512
-	DefaultMaxTurnBytes          = 2 << 20
-	DefaultShutdownTimeout       = 10 * time.Second
-	MaxMessagingPrefixBytes      = 128
-	minMessagingDuration         = time.Millisecond
-	minInboxRetention            = time.Second
-	maxMessagingAttempts         = 10
+	DefaultMessagingPrefix        = "trpc-agent-service:phase3"
+	DefaultLeaseDuration          = 30 * time.Second
+	DefaultHeartbeatInterval      = 10 * time.Second
+	DefaultInitialBackoff         = time.Second
+	DefaultMaxBackoff             = 30 * time.Second
+	DefaultMaxAttempts            = 3
+	DefaultInboxRetention         = 24 * time.Hour
+	DefaultReplyWaitTimeout       = 75 * time.Second
+	DefaultSessionFencing         = "legacy"
+	DefaultSessionLockDuration    = DefaultLeaseDuration
+	DefaultSessionWaitBackoff     = 100 * time.Millisecond
+	DefaultSessionWaitMaxBackoff  = 2 * time.Second
+	DefaultMaxTurnEvents          = 512
+	DefaultMaxTurnBytes           = 2 << 20
+	DefaultShutdownTimeout        = 10 * time.Second
+	DefaultOutboundMaxAttempts    = 5
+	DefaultOutboundInitialBackoff = time.Second
+	DefaultOutboundMaxBackoff     = 30 * time.Second
+	DefaultOutboundSendTimeout    = 10 * time.Second
+	DefaultOutboundClaimIdle      = 30 * time.Second
+	MaxMessagingPrefixBytes       = 128
+	minMessagingDuration          = time.Millisecond
+	minInboxRetention             = time.Second
+	maxMessagingAttempts          = 10
 )
 
 // MessagingConfig owns the platform-level Redis connection and reliability
 // policy. It is independent from tenant Session/Memory storage profiles.
 type MessagingConfig struct {
-	RedisCredentialRef    string
-	RedisURL              string
-	KeyPrefix             string
-	LeaseDuration         time.Duration
-	HeartbeatInterval     time.Duration
-	InitialBackoff        time.Duration
-	MaxBackoff            time.Duration
-	MaxAttempts           int
-	InboxRetention        time.Duration
-	ReplyWaitTimeout      time.Duration
-	SessionFencing        string
-	SessionLockDuration   time.Duration
-	SessionWaitBackoff    time.Duration
-	SessionWaitMaxBackoff time.Duration
-	MaxTurnEvents         int
-	MaxTurnBytes          int
-	ShutdownTimeout       time.Duration
+	RedisCredentialRef     string
+	RedisURL               string
+	KeyPrefix              string
+	LeaseDuration          time.Duration
+	HeartbeatInterval      time.Duration
+	InitialBackoff         time.Duration
+	MaxBackoff             time.Duration
+	MaxAttempts            int
+	InboxRetention         time.Duration
+	ReplyWaitTimeout       time.Duration
+	SessionFencing         string
+	SessionLockDuration    time.Duration
+	SessionWaitBackoff     time.Duration
+	SessionWaitMaxBackoff  time.Duration
+	MaxTurnEvents          int
+	MaxTurnBytes           int
+	ShutdownTimeout        time.Duration
+	OutboundMaxAttempts    int
+	OutboundInitialBackoff time.Duration
+	OutboundMaxBackoff     time.Duration
+	OutboundSendTimeout    time.Duration
+	OutboundClaimIdle      time.Duration
 }
 
 func (c MessagingConfig) String() string {
@@ -73,22 +83,27 @@ func (c MessagingConfig) String() string {
 func (c MessagingConfig) GoString() string { return c.String() }
 
 type messagingConfigFile struct {
-	RedisCredentialRef    string `json:"redis_credential_ref"`
-	KeyPrefix             string `json:"key_prefix"`
-	LeaseDuration         string `json:"lease_duration,omitempty"`
-	HeartbeatInterval     string `json:"heartbeat_interval,omitempty"`
-	InitialBackoff        string `json:"initial_backoff,omitempty"`
-	MaxBackoff            string `json:"max_backoff,omitempty"`
-	MaxAttempts           int    `json:"max_attempts,omitempty"`
-	InboxRetention        string `json:"inbox_retention,omitempty"`
-	ReplyWaitTimeout      string `json:"reply_wait_timeout,omitempty"`
-	SessionFencing        string `json:"session_fencing,omitempty"`
-	SessionLockDuration   string `json:"session_lock_duration,omitempty"`
-	SessionWaitBackoff    string `json:"session_wait_backoff,omitempty"`
-	SessionWaitMaxBackoff string `json:"session_wait_max_backoff,omitempty"`
-	MaxTurnEvents         int    `json:"max_turn_events,omitempty"`
-	MaxTurnBytes          int    `json:"max_turn_bytes,omitempty"`
-	ShutdownTimeout       string `json:"shutdown_timeout,omitempty"`
+	RedisCredentialRef     string `json:"redis_credential_ref"`
+	KeyPrefix              string `json:"key_prefix"`
+	LeaseDuration          string `json:"lease_duration,omitempty"`
+	HeartbeatInterval      string `json:"heartbeat_interval,omitempty"`
+	InitialBackoff         string `json:"initial_backoff,omitempty"`
+	MaxBackoff             string `json:"max_backoff,omitempty"`
+	MaxAttempts            int    `json:"max_attempts,omitempty"`
+	InboxRetention         string `json:"inbox_retention,omitempty"`
+	ReplyWaitTimeout       string `json:"reply_wait_timeout,omitempty"`
+	SessionFencing         string `json:"session_fencing,omitempty"`
+	SessionLockDuration    string `json:"session_lock_duration,omitempty"`
+	SessionWaitBackoff     string `json:"session_wait_backoff,omitempty"`
+	SessionWaitMaxBackoff  string `json:"session_wait_max_backoff,omitempty"`
+	MaxTurnEvents          int    `json:"max_turn_events,omitempty"`
+	MaxTurnBytes           int    `json:"max_turn_bytes,omitempty"`
+	ShutdownTimeout        string `json:"shutdown_timeout,omitempty"`
+	OutboundMaxAttempts    int    `json:"outbound_max_attempts,omitempty"`
+	OutboundInitialBackoff string `json:"outbound_initial_backoff,omitempty"`
+	OutboundMaxBackoff     string `json:"outbound_max_backoff,omitempty"`
+	OutboundSendTimeout    string `json:"outbound_send_timeout,omitempty"`
+	OutboundClaimIdle      string `json:"outbound_claim_idle,omitempty"`
 }
 
 func parseMessagingFile(raw *messagingConfigFile, resolver CredentialResolver) (*MessagingConfig, error) {
@@ -110,23 +125,28 @@ func parseMessagingFile(raw *messagingConfigFile, resolver CredentialResolver) (
 		return nil, errors.New("messaging redis credential is not a valid Redis URL")
 	}
 	config := MessagingConfig{
-		RedisCredentialRef:    raw.RedisCredentialRef,
-		RedisURL:              redisURL,
-		KeyPrefix:             valueOrDefault(raw.KeyPrefix, DefaultMessagingPrefix),
-		LeaseDuration:         DefaultLeaseDuration,
-		HeartbeatInterval:     DefaultHeartbeatInterval,
-		InitialBackoff:        DefaultInitialBackoff,
-		MaxBackoff:            DefaultMaxBackoff,
-		MaxAttempts:           DefaultMaxAttempts,
-		InboxRetention:        DefaultInboxRetention,
-		ReplyWaitTimeout:      DefaultReplyWaitTimeout,
-		SessionFencing:        DefaultSessionFencing,
-		SessionLockDuration:   DefaultSessionLockDuration,
-		SessionWaitBackoff:    DefaultSessionWaitBackoff,
-		SessionWaitMaxBackoff: DefaultSessionWaitMaxBackoff,
-		MaxTurnEvents:         DefaultMaxTurnEvents,
-		MaxTurnBytes:          DefaultMaxTurnBytes,
-		ShutdownTimeout:       DefaultShutdownTimeout,
+		RedisCredentialRef:     raw.RedisCredentialRef,
+		RedisURL:               redisURL,
+		KeyPrefix:              valueOrDefault(raw.KeyPrefix, DefaultMessagingPrefix),
+		LeaseDuration:          DefaultLeaseDuration,
+		HeartbeatInterval:      DefaultHeartbeatInterval,
+		InitialBackoff:         DefaultInitialBackoff,
+		MaxBackoff:             DefaultMaxBackoff,
+		MaxAttempts:            DefaultMaxAttempts,
+		InboxRetention:         DefaultInboxRetention,
+		ReplyWaitTimeout:       DefaultReplyWaitTimeout,
+		SessionFencing:         DefaultSessionFencing,
+		SessionLockDuration:    DefaultSessionLockDuration,
+		SessionWaitBackoff:     DefaultSessionWaitBackoff,
+		SessionWaitMaxBackoff:  DefaultSessionWaitMaxBackoff,
+		MaxTurnEvents:          DefaultMaxTurnEvents,
+		MaxTurnBytes:           DefaultMaxTurnBytes,
+		ShutdownTimeout:        DefaultShutdownTimeout,
+		OutboundMaxAttempts:    DefaultOutboundMaxAttempts,
+		OutboundInitialBackoff: DefaultOutboundInitialBackoff,
+		OutboundMaxBackoff:     DefaultOutboundMaxBackoff,
+		OutboundSendTimeout:    DefaultOutboundSendTimeout,
+		OutboundClaimIdle:      DefaultOutboundClaimIdle,
 	}
 	if config.LeaseDuration, err = parseOptionalDuration(raw.LeaseDuration, config.LeaseDuration); err != nil {
 		return nil, errors.New("messaging lease_duration is invalid")
@@ -161,6 +181,18 @@ func parseMessagingFile(raw *messagingConfigFile, resolver CredentialResolver) (
 	if config.ShutdownTimeout, err = parseOptionalDuration(raw.ShutdownTimeout, config.ShutdownTimeout); err != nil {
 		return nil, errors.New("messaging shutdown_timeout is invalid")
 	}
+	if config.OutboundInitialBackoff, err = parseOptionalDuration(raw.OutboundInitialBackoff, config.OutboundInitialBackoff); err != nil {
+		return nil, errors.New("messaging outbound_initial_backoff is invalid")
+	}
+	if config.OutboundMaxBackoff, err = parseOptionalDuration(raw.OutboundMaxBackoff, config.OutboundMaxBackoff); err != nil {
+		return nil, errors.New("messaging outbound_max_backoff is invalid")
+	}
+	if config.OutboundSendTimeout, err = parseOptionalDuration(raw.OutboundSendTimeout, config.OutboundSendTimeout); err != nil {
+		return nil, errors.New("messaging outbound_send_timeout is invalid")
+	}
+	if config.OutboundClaimIdle, err = parseOptionalDuration(raw.OutboundClaimIdle, config.OutboundClaimIdle); err != nil {
+		return nil, errors.New("messaging outbound_claim_idle is invalid")
+	}
 	if raw.MaxTurnEvents != 0 {
 		config.MaxTurnEvents = raw.MaxTurnEvents
 	}
@@ -170,6 +202,9 @@ func parseMessagingFile(raw *messagingConfigFile, resolver CredentialResolver) (
 	if raw.MaxAttempts != 0 {
 		config.MaxAttempts = raw.MaxAttempts
 	}
+	if raw.OutboundMaxAttempts != 0 {
+		config.OutboundMaxAttempts = raw.OutboundMaxAttempts
+	}
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -178,23 +213,28 @@ func parseMessagingFile(raw *messagingConfigFile, resolver CredentialResolver) (
 
 func legacyMessaging(redisURL, redisPrefix string) MessagingConfig {
 	return MessagingConfig{
-		RedisCredentialRef:    legacyRedisCredential,
-		RedisURL:              redisURL,
-		KeyPrefix:             strings.TrimRight(valueOrDefault(redisPrefix, DefaultRedisPrefix), ":") + ":messaging",
-		LeaseDuration:         DefaultLeaseDuration,
-		HeartbeatInterval:     DefaultHeartbeatInterval,
-		InitialBackoff:        DefaultInitialBackoff,
-		MaxBackoff:            DefaultMaxBackoff,
-		MaxAttempts:           DefaultMaxAttempts,
-		InboxRetention:        DefaultInboxRetention,
-		ReplyWaitTimeout:      DefaultReplyWaitTimeout,
-		SessionFencing:        DefaultSessionFencing,
-		SessionLockDuration:   DefaultSessionLockDuration,
-		SessionWaitBackoff:    DefaultSessionWaitBackoff,
-		SessionWaitMaxBackoff: DefaultSessionWaitMaxBackoff,
-		MaxTurnEvents:         DefaultMaxTurnEvents,
-		MaxTurnBytes:          DefaultMaxTurnBytes,
-		ShutdownTimeout:       DefaultShutdownTimeout,
+		RedisCredentialRef:     legacyRedisCredential,
+		RedisURL:               redisURL,
+		KeyPrefix:              strings.TrimRight(valueOrDefault(redisPrefix, DefaultRedisPrefix), ":") + ":messaging",
+		LeaseDuration:          DefaultLeaseDuration,
+		HeartbeatInterval:      DefaultHeartbeatInterval,
+		InitialBackoff:         DefaultInitialBackoff,
+		MaxBackoff:             DefaultMaxBackoff,
+		MaxAttempts:            DefaultMaxAttempts,
+		InboxRetention:         DefaultInboxRetention,
+		ReplyWaitTimeout:       DefaultReplyWaitTimeout,
+		SessionFencing:         DefaultSessionFencing,
+		SessionLockDuration:    DefaultSessionLockDuration,
+		SessionWaitBackoff:     DefaultSessionWaitBackoff,
+		SessionWaitMaxBackoff:  DefaultSessionWaitMaxBackoff,
+		MaxTurnEvents:          DefaultMaxTurnEvents,
+		MaxTurnBytes:           DefaultMaxTurnBytes,
+		ShutdownTimeout:        DefaultShutdownTimeout,
+		OutboundMaxAttempts:    DefaultOutboundMaxAttempts,
+		OutboundInitialBackoff: DefaultOutboundInitialBackoff,
+		OutboundMaxBackoff:     DefaultOutboundMaxBackoff,
+		OutboundSendTimeout:    DefaultOutboundSendTimeout,
+		OutboundClaimIdle:      DefaultOutboundClaimIdle,
 	}
 }
 
@@ -229,6 +269,26 @@ func (c MessagingConfig) Validate() error {
 	shutdownTimeout := c.ShutdownTimeout
 	if shutdownTimeout == 0 {
 		shutdownTimeout = DefaultShutdownTimeout
+	}
+	outboundAttempts := c.OutboundMaxAttempts
+	if outboundAttempts == 0 {
+		outboundAttempts = DefaultOutboundMaxAttempts
+	}
+	outboundInitial := c.OutboundInitialBackoff
+	if outboundInitial == 0 {
+		outboundInitial = DefaultOutboundInitialBackoff
+	}
+	outboundMax := c.OutboundMaxBackoff
+	if outboundMax == 0 {
+		outboundMax = DefaultOutboundMaxBackoff
+	}
+	outboundSendTimeout := c.OutboundSendTimeout
+	if outboundSendTimeout == 0 {
+		outboundSendTimeout = DefaultOutboundSendTimeout
+	}
+	outboundClaimIdle := c.OutboundClaimIdle
+	if outboundClaimIdle == 0 {
+		outboundClaimIdle = DefaultOutboundClaimIdle
 	}
 	prefix := strings.TrimRight(strings.TrimSpace(c.KeyPrefix), ":")
 	if prefix == "" || len(prefix) > MaxMessagingPrefixBytes {
@@ -283,6 +343,15 @@ func (c MessagingConfig) Validate() error {
 	}
 	if shutdownTimeout < minMessagingDuration {
 		return errors.New("messaging shutdown_timeout must be positive")
+	}
+	if outboundAttempts < 1 || outboundAttempts > maxMessagingAttempts {
+		return fmt.Errorf("messaging outbound_max_attempts must be between 1 and %d", maxMessagingAttempts)
+	}
+	if outboundInitial < minMessagingDuration || outboundMax < minMessagingDuration || outboundSendTimeout < minMessagingDuration || outboundClaimIdle < minMessagingDuration {
+		return errors.New("messaging outbound durations must be positive")
+	}
+	if outboundInitial > outboundMax {
+		return errors.New("messaging outbound_initial_backoff must not exceed outbound_max_backoff")
 	}
 	return nil
 }

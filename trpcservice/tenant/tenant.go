@@ -44,6 +44,9 @@ type ChannelBinding struct {
 	ID                string `json:"id"`
 	Channel           string `json:"channel"`
 	ExternalAccountID string `json:"external_account_id"`
+	CredentialRef     string `json:"credential_ref,omitempty"`
+	BotIDRef          string `json:"bot_id_ref,omitempty"`
+	BotSecretRef      string `json:"bot_secret_ref,omitempty"`
 	TenantID          string `json:"tenant_id"`
 	AgentAppID        string `json:"agent_app_id"`
 	Enabled           bool   `json:"enabled"`
@@ -249,6 +252,7 @@ func NewPresetRepository(catalog Catalog) (*PresetRepository, error) {
 	}
 
 	bindingIDs := make(map[string]struct{}, len(catalog.ChannelBindings))
+	activeAccounts := make(map[string]string, len(catalog.ChannelBindings))
 	for _, current := range catalog.ChannelBindings {
 		if err := ValidateID("binding id", current.ID); err != nil {
 			return nil, err
@@ -266,6 +270,16 @@ func NewPresetRepository(catalog Catalog) (*PresetRepository, error) {
 		}
 		if current.Enabled && (!tenantValue.Enabled || !appValue.Enabled) {
 			return nil, fmt.Errorf("enabled binding %q references a disabled tenant or agent app", current.ID)
+		}
+		if err := validateChannelBinding(current); err != nil {
+			return nil, err
+		}
+		if current.Enabled {
+			accountKey := current.Channel + "\x00" + current.ExternalAccountID
+			if existing, exists := activeAccounts[accountKey]; exists {
+				return nil, fmt.Errorf("enabled bindings %q and %q reuse the same external account", existing, current.ID)
+			}
+			activeAccounts[accountKey] = current.ID
 		}
 		if _, exists := bindingIDs[current.ID]; exists {
 			return nil, fmt.Errorf("duplicate binding id %q", current.ID)
@@ -286,6 +300,26 @@ func NewPresetRepository(catalog Catalog) (*PresetRepository, error) {
 		return r.activeProfiles[i].TenantID < r.activeProfiles[j].TenantID
 	})
 	return r, nil
+}
+
+func validateChannelBinding(current ChannelBinding) error {
+	switch current.Channel {
+	case "demo":
+		if current.CredentialRef != "" || current.BotIDRef != "" || current.BotSecretRef != "" {
+			return fmt.Errorf("demo binding %q must not configure IM credentials", current.ID)
+		}
+	case "telegram":
+		if strings.TrimSpace(current.CredentialRef) == "" || current.BotIDRef != "" || current.BotSecretRef != "" {
+			return fmt.Errorf("telegram binding %q requires credential_ref only", current.ID)
+		}
+	case "wecom_aibot":
+		if current.CredentialRef != "" || strings.TrimSpace(current.BotIDRef) == "" || strings.TrimSpace(current.BotSecretRef) == "" {
+			return fmt.Errorf("wecom_aibot binding %q requires bot_id_ref and bot_secret_ref only", current.ID)
+		}
+	default:
+		return fmt.Errorf("binding %q has unsupported channel %q", current.ID, current.Channel)
+	}
+	return nil
 }
 
 func (r *PresetRepository) ResolveBinding(ctx context.Context, channel, bindingID string) (ChannelBinding, error) {

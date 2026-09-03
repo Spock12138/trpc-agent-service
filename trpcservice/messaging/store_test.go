@@ -357,6 +357,10 @@ func TestRejectTamperedDigestStoresTerminalFailure(t *testing.T) {
 	if err != nil || snapshot.State != StateFailedTerminal || snapshot.ErrorCode != "invalid_task" {
 		t.Fatalf("terminal snapshot = (%#v, %v)", snapshot, err)
 	}
+	reply, err := store.ReadReply(context.Background(), "gateway-invalid", time.Millisecond)
+	if err != nil || reply.Result.Target.Valid() {
+		t.Fatalf("invalid task reply target = (%#v, %v)", reply.Result.Target, err)
+	}
 }
 
 func newTestStore(t *testing.T) (*Store, *miniredis.Miniredis) {
@@ -383,8 +387,9 @@ func newTestStore(t *testing.T) (*Store, *miniredis.Miniredis) {
 func testTask(taskID, messageID string) message.ExecutionTask {
 	task := message.ExecutionTask{
 		SchemaVersion: message.TaskSchemaVersion, TaskID: taskID, Channel: "demo",
-		ChannelBindingID: "binding-a", TenantID: "tenant-a", AgentAppID: "assistant", ConfigVersion: "v1",
+		ChannelBindingID: "binding-a", ExternalAccountID: "demo-account", TenantID: "tenant-a", AgentAppID: "assistant", ConfigVersion: "v1",
 		RunnerUserID: "u_user", SessionID: "s_session", PlatformMessageID: messageID,
+		ActorUserID: "actor-a", ConversationID: "conversation-a", ConversationType: message.ConversationDirect,
 		Text: "hello", RequestID: "request", TraceID: "trace", ReceivedAt: time.Now().UTC(), Attempt: 1,
 	}
 	task.PayloadDigest = task.CanonicalDigest()

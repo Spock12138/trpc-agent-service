@@ -71,6 +71,41 @@ func TestPresetRepositoryRejectsInvalidReferencesAndDuplicates(t *testing.T) {
 	}
 }
 
+func TestChannelBindingCredentialContracts(t *testing.T) {
+	tests := []struct {
+		name    string
+		binding ChannelBinding
+	}{
+		{name: "unsupported channel", binding: ChannelBinding{Channel: "unknown"}},
+		{name: "demo with token", binding: ChannelBinding{Channel: "demo", CredentialRef: "env:TOKEN"}},
+		{name: "telegram without token", binding: ChannelBinding{Channel: "telegram"}},
+		{name: "telegram with wecom reference", binding: ChannelBinding{Channel: "telegram", CredentialRef: "env:TOKEN", BotIDRef: "env:BOT_ID"}},
+		{name: "wecom missing secret", binding: ChannelBinding{Channel: "wecom_aibot", BotIDRef: "env:BOT_ID"}},
+		{name: "wecom with telegram token", binding: ChannelBinding{Channel: "wecom_aibot", CredentialRef: "env:TOKEN", BotIDRef: "env:BOT_ID", BotSecretRef: "env:BOT_SECRET"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			catalog := testCatalog()
+			test.binding.ID = "binding-a"
+			test.binding.ExternalAccountID = "account-a"
+			test.binding.TenantID = "tenant-a"
+			test.binding.AgentAppID = "assistant"
+			test.binding.Enabled = true
+			catalog.ChannelBindings[0] = test.binding
+			if _, err := NewPresetRepository(catalog); err == nil {
+				t.Fatal("invalid channel credential contract was accepted")
+			}
+		})
+	}
+
+	catalog := testCatalog()
+	catalog.ChannelBindings[0] = ChannelBinding{ID: "telegram-a", Channel: "telegram", ExternalAccountID: "123", CredentialRef: "env:TOKEN_A", TenantID: "tenant-a", AgentAppID: "assistant", Enabled: true}
+	catalog.ChannelBindings = append(catalog.ChannelBindings, ChannelBinding{ID: "telegram-b", Channel: "telegram", ExternalAccountID: "123", CredentialRef: "env:TOKEN_B", TenantID: "tenant-a", AgentAppID: "assistant", Enabled: true})
+	if _, err := NewPresetRepository(catalog); err == nil {
+		t.Fatal("duplicate enabled external account was accepted")
+	}
+}
+
 func TestPresetRepositoryHidesDisabledAndUnknownBindings(t *testing.T) {
 	catalog := testCatalog()
 	catalog.ChannelBindings[0].Enabled = false

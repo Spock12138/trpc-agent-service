@@ -64,3 +64,7 @@ func SessionLock(prefix, coord string) string {
 func SessionWait(prefix string) string {
 	return CoordinationPrefix(prefix) + ":session:wait"
 }
+
+func Outbound(prefix, taskID string) string {
+	return CoordinationPrefix(prefix) + ":outbound:" + taskID
+}

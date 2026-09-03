@@ -182,9 +182,10 @@ func newWorkerStore(t *testing.T, backoff, lease time.Duration) *messaging.Store
 
 func workerTask(id string) message.ExecutionTask {
 	task := message.ExecutionTask{
-		SchemaVersion: 1, TaskID: "task-" + id, Channel: "demo", ChannelBindingID: "binding",
+		SchemaVersion: message.TaskSchemaVersion, TaskID: "task-" + id, Channel: "demo", ChannelBindingID: "binding", ExternalAccountID: "demo-account",
 		TenantID: "tenant", AgentAppID: "app", ConfigVersion: "v1", RunnerUserID: "u", SessionID: "s",
-		PlatformMessageID: "message-" + id, Text: "hello", RequestID: "request", TraceID: "trace",
+		PlatformMessageID: "message-" + id, ActorUserID: "actor", ConversationID: "conversation", ConversationType: message.ConversationDirect,
+		Text: "hello", RequestID: "request", TraceID: "trace",
 		ReceivedAt: time.Now().UTC(), Attempt: 1,
 	}
 	task.PayloadDigest = task.CanonicalDigest()
