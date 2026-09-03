@@ -4,8 +4,10 @@ go 1.21
 
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
+	github.com/go-telegram/bot v1.25.0
 	github.com/openai/openai-go v1.12.0
 	github.com/redis/go-redis/v9 v9.11.0
+	golang.org/x/net v0.34.0
 	trpc.group/trpc-go/trpc-agent-go v1.11.2
 	trpc.group/trpc-go/trpc-agent-go/memory/redis v1.11.0
 	trpc.group/trpc-go/trpc-agent-go/session/redis v1.11.0
@@ -42,7 +44,6 @@ require (
 	go.opentelemetry.io/proto/otlp v1.3.1 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
-	golang.org/x/net v0.34.0 // indirect
 	golang.org/x/sync v0.10.0 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
