@@ -249,6 +249,29 @@ GET  /api/v1/web/messages/{message_id}?binding_id=<demo-binding>
 
 出站状态保存在 `<prefix>:reliable-v1:outbound:<task_id>`。发送成功或达到默认 5 次上限后，Lua 才原子更新终态并确认 Reply Stream；Gateway 重启会恢复 Pending 和 attempts。外部发送成功、Redis 确认前崩溃仍可能重复，因此只承诺至少一次。完整实现和验收矩阵见 [`docs/stage5-telegram-wecom-webui.md`](docs/stage5-telegram-wecom-webui.md)。
 
+### Phase 5.5 Redis / PostgreSQL / MySQL 多后端持久化
+
+Phase 5.5 允许每个 Tenant/Agent App 选择 Redis、PostgreSQL 或 MySQL Session/Memory；Redis 始终承担 Streams、Inbox、lease、Session lock、重试和接管。SQL Turn 成功提交后才会写成功结果和 Reply，SQL 故障不会回退 Redis，也不会重新调用模型。
+
+三租户示例为 `configs/phase5.5.example.json`：
+
+```bash
+export IDENTITY_SECRET='replace-with-at-least-32-random-bytes'
+export PLATFORM_CONFIG_FILE='configs/phase5.5.example.json'
+export PHASE55_MODEL_KEY='replace-with-model-key'
+export PHASE55_REDIS_URL='redis://localhost:6379/0'
+export PHASE55_POSTGRES_DSN='postgres://user:password@localhost:5432/app?sslmode=require'
+export PHASE55_MYSQL_DSN='user:password@tcp(localhost:3306)/app?parseTime=true&charset=utf8mb4&loc=UTC'
+
+./bin/trpc-service gateway -addr :8080 -consumer gateway-a
+./bin/trpc-service worker -health-addr :8081 -consumer worker-a
+./bin/trpc-service worker -health-addr :8082 -consumer worker-b
+```
+
+配置文件只保存 `env:` 引用。PostgreSQL schema 必须预先存在；`skip_db_init=false` 创建并验证表，`true` 只验证现有表。每个 Agent App 首次执行时在 Messaging Redis 锁定脱敏后端指纹，后续禁止改变 backend/database/schema/prefix，但允许密码和 TLS 配置轮换。
+
+PostgreSQL `session/postgres v1.11.0` 的跨时区 Summary 缺陷仍存在，因此 PostgreSQL Summary 在本阶段强制禁用。SQL Memory 固定无限容量、无 Extractor、无 Memory Tool。完整状态机、SQL 事务、错误码、schema/版本契约和升级门槛见 [`docs/stage5.5-sql-persistence.md`](docs/stage5.5-sql-persistence.md)。
+
 停止服务：
 
 ```bash
