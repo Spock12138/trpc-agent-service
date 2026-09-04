@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/redistopology"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
 	"github.com/redis/go-redis/v9"
@@ -42,7 +43,10 @@ type RedisBackend struct {
 	strong       bool
 	redisURL     string
 	messagingURL string
+	fingerprint  persistence.BackendFingerprint
 }
+
+func (b *RedisBackend) Fingerprint() persistence.BackendFingerprint { return b.fingerprint }
 
 // NewRedisBackend validates the Redis URL and namespace without contacting
 // Redis. The normalized prefix is always isolated below the official-v1

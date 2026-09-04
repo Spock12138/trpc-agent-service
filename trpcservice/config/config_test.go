@@ -108,6 +108,29 @@ func TestPhase4ExampleConfigParses(t *testing.T) {
 	}
 }
 
+func TestPhase55ExampleConfigParses(t *testing.T) {
+	t.Setenv("IDENTITY_SECRET", strings.Repeat("i", 32))
+	t.Setenv("PHASE55_REDIS_URL", "redis://localhost:6379/0")
+	t.Setenv("PHASE55_POSTGRES_DSN", "postgres://user:secret@localhost:5432/app?sslmode=disable")
+	t.Setenv("PHASE55_MYSQL_DSN", "user:secret@tcp(localhost:3306)/app?parseTime=true&charset=utf8mb4&loc=UTC")
+	t.Setenv("PHASE55_MODEL_KEY", "model-secret")
+	t.Setenv("PLATFORM_CONFIG_FILE", filepath.Join("..", "..", "configs", "phase5.5.example.json"))
+	cfg, err := LoadForRole(RoleServe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Messaging == nil || cfg.Messaging.PersistenceMaxAttempts != 5 || cfg.Messaging.PersistencePayloadMaxBytes != 4<<20 || len(cfg.Catalog.StorageProfiles) != 3 ||
+		cfg.Catalog.StorageProfiles[0].Kind != tenant.StorageKindRedis || cfg.Catalog.StorageProfiles[1].Kind != tenant.StorageKindPostgres || cfg.Catalog.StorageProfiles[2].Kind != tenant.StorageKindMySQL {
+		t.Fatalf("unexpected Phase 5.5 config: %#v", cfg)
+	}
+	formatted := fmt.Sprintf("%+v", cfg)
+	for _, secret := range []string{"user:secret", "localhost:5432", "localhost:3306", "/app"} {
+		if strings.Contains(formatted, secret) {
+			t.Fatalf("Phase 5.5 formatted config leaked SQL credential material %q: %s", secret, formatted)
+		}
+	}
+}
+
 func TestMessagingTurnLimitsDefaultsAndJSONOverrides(t *testing.T) {
 	resolver := NewStaticCredentialResolver(map[string]string{"env:REDIS_URL": "redis://localhost:6379/0"})
 	defaults, err := parseMessagingFile(&messagingConfigFile{RedisCredentialRef: "env:REDIS_URL", KeyPrefix: "phase4-defaults"}, resolver)
@@ -175,6 +198,55 @@ func writeCatalogBytes(t *testing.T, data []byte) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestMessagingPersistenceDefaultsAndOverrides(t *testing.T) {
+	resolver := NewStaticCredentialResolver(map[string]string{"env:REDIS_URL": "redis://localhost:6379/0"})
+	defaults, err := parseMessagingFile(&messagingConfigFile{RedisCredentialRef: "env:REDIS_URL", KeyPrefix: "phase55-defaults"}, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.PersistenceTimeout != DefaultPersistenceTimeout || defaults.PersistenceMaxAttempts != DefaultPersistenceMaxAttempts ||
+		defaults.PersistenceInitialBackoff != DefaultPersistenceInitialBackoff || defaults.PersistenceMaxBackoff != DefaultPersistenceMaxBackoff ||
+		defaults.PersistencePayloadMaxBytes != DefaultPersistencePayloadMaxBytes {
+		t.Fatalf("unexpected persistence defaults: %#v", defaults)
+	}
+	overrides, err := parseMessagingFile(&messagingConfigFile{
+		RedisCredentialRef: "env:REDIS_URL", KeyPrefix: "phase55-overrides",
+		MaxTurnBytes: 4096, PersistenceTimeout: "3s", PersistenceMaxAttempts: 4,
+		PersistenceInitialBackoff: "25ms", PersistenceMaxBackoff: "2s", PersistencePayloadMaxBytes: 8192,
+	}, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overrides.PersistenceTimeout != 3*time.Second || overrides.PersistenceMaxAttempts != 4 ||
+		overrides.PersistenceInitialBackoff != 25*time.Millisecond || overrides.PersistenceMaxBackoff != 2*time.Second ||
+		overrides.PersistencePayloadMaxBytes != 8192 {
+		t.Fatalf("unexpected persistence overrides: %#v", overrides)
+	}
+}
+
+func TestMessagingPersistenceValidation(t *testing.T) {
+	base := MessagingConfig{RedisURL: "redis://localhost:6379/0", KeyPrefix: "phase55", LeaseDuration: time.Second,
+		HeartbeatInterval: 100 * time.Millisecond, InitialBackoff: time.Millisecond, MaxBackoff: time.Second,
+		MaxAttempts: 3, InboxRetention: time.Second, ReplyWaitTimeout: time.Second, SessionFencing: "strong",
+		SessionLockDuration: time.Second, SessionWaitBackoff: time.Millisecond, SessionWaitMaxBackoff: time.Second,
+		MaxTurnEvents: 10, MaxTurnBytes: 4096, ShutdownTimeout: time.Second, OutboundMaxAttempts: 3,
+		OutboundInitialBackoff: time.Millisecond, OutboundMaxBackoff: time.Second, OutboundSendTimeout: time.Second,
+		OutboundClaimIdle: time.Second, PersistenceTimeout: time.Second, PersistenceMaxAttempts: 3,
+		PersistenceInitialBackoff: time.Millisecond, PersistenceMaxBackoff: time.Second, PersistencePayloadMaxBytes: 4096}
+	tests := []func(*MessagingConfig){
+		func(c *MessagingConfig) { c.PersistenceMaxAttempts = 11 },
+		func(c *MessagingConfig) { c.PersistencePayloadMaxBytes = 2048 },
+		func(c *MessagingConfig) { c.PersistenceInitialBackoff = 2 * time.Second },
+	}
+	for _, mutate := range tests {
+		cfg := base
+		mutate(&cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("invalid persistence config unexpectedly passed: %#v", cfg)
+		}
+	}
 }
 
 func validCatalogJSON() string {

@@ -68,3 +68,11 @@ func SessionWait(prefix string) string {
 func Outbound(prefix, taskID string) string {
 	return CoordinationPrefix(prefix) + ":outbound:" + taskID
 }
+
+func BackendFingerprint(prefix, tenantID, agentAppID string) string {
+	return CoordinationPrefix(prefix) + ":backend:fingerprint:" + DigestCoord(tenantID, agentAppID)
+}
+
+func PersistenceRetry(prefix string) string {
+	return CoordinationPrefix(prefix) + ":persistence:retry"
+}

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -454,7 +455,7 @@ func loadPlatformFile(path string) (tenant.Catalog, *messagingConfigFile, error)
 		})
 	}
 	for _, profile := range catalog.StorageProfiles {
-		if profile.Kind == tenant.StorageKindRedis {
+		if profile.Kind == tenant.StorageKindRedis || profile.Kind == tenant.StorageKindPostgres || profile.Kind == tenant.StorageKindMySQL {
 			if _, err := envNameFromCredentialRef(profile.CredentialRef); err != nil {
 				return tenant.Catalog{}, nil, err
 			}
@@ -496,13 +497,19 @@ func validateCatalogCredentials(catalog tenant.Catalog, resolver CredentialResol
 		}
 		profileKey := current.TenantID + "\x00" + current.StorageProfileID
 		profile := profiles[profileKey]
-		if profile.Kind == tenant.StorageKindRedis && !checkedProfiles[profileKey] {
+		if profile.Kind != tenant.StorageKindInMemory && !checkedProfiles[profileKey] {
 			value, err := resolver.Resolve(profile.CredentialRef)
 			if err != nil {
 				return fmt.Errorf("storage credential unavailable for enabled config: %w", err)
 			}
-			if _, err := NormalizeRedisURL(value); err != nil {
-				return errors.New("storage credential for enabled config is not a valid Redis URL")
+			if profile.Kind == tenant.StorageKindRedis {
+				value, err = NormalizeRedisURL(value)
+				if err != nil {
+					return errors.New("storage credential for enabled config is not a valid Redis URL")
+				}
+			}
+			if _, err := persistence.FingerprintForProfile(profile, value); err != nil {
+				return errors.New("storage credential for enabled config is invalid for configured backend")
 			}
 			checkedProfiles[profileKey] = true
 		}

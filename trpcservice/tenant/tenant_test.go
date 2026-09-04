@@ -3,6 +3,7 @@ package tenant
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -129,6 +130,59 @@ func TestValidateIDAndAppName(t *testing.T) {
 	}
 	if got := AppName("tenant-a", "assistant"); got != "tenant/tenant-a/app/assistant" {
 		t.Fatalf("AppName() = %q", got)
+	}
+}
+
+func TestNormalizeSQLStorageProfiles(t *testing.T) {
+	postgres, err := NormalizeStorageProfile(StorageProfile{
+		TenantID: "tenant-a", ID: "pg", Kind: StorageKindPostgres,
+		CredentialRef: "env:PG_DSN", TablePrefix: "tenant_a", SkipDBInit: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if postgres.TablePrefix != "tenant_a_" || postgres.Schema != "public" || !postgres.SkipDBInit {
+		t.Fatalf("normalized postgres profile = %#v", postgres)
+	}
+	mysql, err := NormalizeStorageProfile(StorageProfile{
+		TenantID: "tenant-a", ID: "mysql", Kind: StorageKindMySQL,
+		CredentialRef: "env:MYSQL_DSN", TablePrefix: "tenant_a_",
+	})
+	if err != nil || mysql.TablePrefix != "tenant_a_" || mysql.Schema != "" {
+		t.Fatalf("normalized mysql profile = (%#v, %v)", mysql, err)
+	}
+}
+
+func TestNormalizeStorageProfileRejectsCrossKindFields(t *testing.T) {
+	tests := []StorageProfile{
+		{ID: "redis", Kind: StorageKindRedis, CredentialRef: "env:REDIS", KeyPrefix: "x", TablePrefix: "sql"},
+		{ID: "pg", Kind: StorageKindPostgres, CredentialRef: "env:PG", TablePrefix: "bad-prefix"},
+		{ID: "mysql", Kind: StorageKindMySQL, CredentialRef: "env:MYSQL", TablePrefix: "ok", Schema: "public"},
+		{ID: "memory", Kind: StorageKindInMemory, SkipDBInit: true},
+	}
+	for _, profile := range tests {
+		if _, err := NormalizeStorageProfile(profile); err == nil {
+			t.Fatalf("NormalizeStorageProfile(%#v) unexpectedly succeeded", profile)
+		}
+	}
+}
+
+func TestNormalizeSQLStorageProfileEnforcesOfficialIndexNameLimits(t *testing.T) {
+	postgres := StorageProfile{ID: "pg", Kind: StorageKindPostgres, CredentialRef: "env:PG", Schema: "public", TablePrefix: strings.Repeat("a", 20) + "_"}
+	if _, err := NormalizeStorageProfile(postgres); err != nil {
+		t.Fatalf("PostgreSQL boundary prefix rejected: %v", err)
+	}
+	postgres.TablePrefix = strings.Repeat("a", 21) + "_"
+	if _, err := NormalizeStorageProfile(postgres); err == nil {
+		t.Fatal("PostgreSQL prefix producing a truncated official index was accepted")
+	}
+	mysql := StorageProfile{ID: "mysql", Kind: StorageKindMySQL, CredentialRef: "env:MYSQL", TablePrefix: strings.Repeat("a", 28) + "_"}
+	if _, err := NormalizeStorageProfile(mysql); err != nil {
+		t.Fatalf("MySQL boundary prefix rejected: %v", err)
+	}
+	mysql.TablePrefix = strings.Repeat("a", 29) + "_"
+	if _, err := NormalizeStorageProfile(mysql); err == nil {
+		t.Fatal("MySQL prefix producing a truncated official index was accepted")
 	}
 }
 

@@ -1,19 +1,29 @@
 module github.com/liuzengh/trpc-agent-service
 
-go 1.21
+go 1.21.0
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/alicebob/miniredis/v2 v2.35.0
+	github.com/go-sql-driver/mysql v1.9.3
 	github.com/go-telegram/bot v1.25.0
+	github.com/jackc/pgx/v5 v5.7.2
 	github.com/openai/openai-go v1.12.0
 	github.com/redis/go-redis/v9 v9.11.0
 	golang.org/x/net v0.34.0
 	trpc.group/trpc-go/trpc-agent-go v1.11.2
+	trpc.group/trpc-go/trpc-agent-go/memory/mysql v1.11.0
+	trpc.group/trpc-go/trpc-agent-go/memory/postgres v1.11.0
 	trpc.group/trpc-go/trpc-agent-go/memory/redis v1.11.0
+	trpc.group/trpc-go/trpc-agent-go/session/mysql v1.11.2
+	trpc.group/trpc-go/trpc-agent-go/session/postgres v1.11.0
 	trpc.group/trpc-go/trpc-agent-go/session/redis v1.11.0
+	trpc.group/trpc-go/trpc-agent-go/storage/mysql v1.11.0
+	trpc.group/trpc-go/trpc-agent-go/storage/postgres v1.11.0
 )
 
 require (
+	filippo.io/edwards25519 v1.1.1 // indirect
 	github.com/bmatcuk/doublestar/v4 v4.9.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -24,6 +34,9 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.22.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/panjf2000/ants/v2 v2.10.0 // indirect
 	github.com/tidwall/gjson v1.14.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
@@ -42,8 +55,9 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.29.0 // indirect
 	go.opentelemetry.io/otel/trace v1.29.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.3.1 // indirect
-	go.uber.org/multierr v1.10.0 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
+	golang.org/x/crypto v0.32.0 // indirect
 	golang.org/x/sync v0.10.0 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/text v0.21.0 // indirect

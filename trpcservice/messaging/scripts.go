@@ -150,7 +150,8 @@ local stream_type = redis.call('TYPE', KEYS[2])
 if type(inbox_type) == 'table' then inbox_type = inbox_type.ok end
 if type(stream_type) == 'table' then stream_type = stream_type.ok end
 if inbox_type ~= 'hash' or (stream_type ~= 'none' and stream_type ~= 'stream') then return -9 end
-if redis.call('HGET', KEYS[1], 'state') ~= 'processing' or
+local state=redis.call('HGET', KEYS[1], 'state')
+if (state ~= 'processing' and state ~= 'persisting') or
    redis.call('HGET', KEYS[1], 'task_id') ~= ARGV[1] or
    redis.call('HGET', KEYS[1], 'owner') ~= ARGV[2] or
    tonumber(redis.call('HGET', KEYS[1], 'lease_epoch') or '0') ~= tonumber(ARGV[3]) or
@@ -177,7 +178,8 @@ if redis.call('HGET', KEYS[1], 'token') ~= ARGV[4] then return 0 end
 if redis.call('HGET', KEYS[1], 'task_id') ~= ARGV[1] then return 0 end
 if redis.call('HGET', KEYS[1], 'owner') ~= ARGV[2] then return 0 end
 if tonumber(redis.call('HGET', KEYS[1], 'lease_epoch') or '0') ~= tonumber(ARGV[3]) then return 0 end
-if redis.call('HGET', KEYS[2], 'state') ~= 'processing' then return 0 end
+local state=redis.call('HGET', KEYS[2], 'state')
+if state ~= 'processing' and state ~= 'persisting' then return 0 end
 if redis.call('HGET', KEYS[2], 'task_id') ~= ARGV[1] then return 0 end
 if redis.call('HGET', KEYS[2], 'owner') ~= ARGV[2] then return 0 end
 if tonumber(redis.call('HGET', KEYS[2], 'lease_epoch') or '0') ~= tonumber(ARGV[3]) then return 0 end

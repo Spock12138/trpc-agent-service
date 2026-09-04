@@ -159,6 +159,47 @@ func TestStrongBackendProviderRejectsInMemoryAndCrossRedis(t *testing.T) {
 	}
 }
 
+func TestBackendProviderReadinessIsolatesUnavailableSQLProfile(t *testing.T) {
+	catalog := providerCatalog()
+	catalog.Tenants[1].ID = "tenant-mysql"
+	catalog.StorageProfiles[1] = tenant.StorageProfile{TenantID: "tenant-mysql", ID: "mysql-v1", Kind: tenant.StorageKindMySQL, CredentialRef: "env:MYSQL_DSN", TablePrefix: "tenant_mysql"}
+	catalog.AgentApps[1].TenantID = "tenant-mysql"
+	catalog.ConfigVersions[1].TenantID = "tenant-mysql"
+	catalog.ConfigVersions[1].StorageProfileID = "mysql-v1"
+	catalog.ChannelBindings[1].TenantID = "tenant-mysql"
+	catalog.ChannelBindings[1].ID = "mysql-binding"
+	catalog.ChannelBindings[1].ExternalAccountID = "mysql-binding"
+	catalog.Tenants = catalog.Tenants[1:]
+	catalog.StorageProfiles = catalog.StorageProfiles[1:]
+	catalog.AgentApps = catalog.AgentApps[1:]
+	catalog.ConfigVersions = catalog.ConfigVersions[1:]
+	catalog.ChannelBindings = catalog.ChannelBindings[1:]
+	repository, err := tenant.NewPresetRepository(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := NewBackendProvider(repository, config.NewStaticCredentialResolver(map[string]string{
+		"env:MODEL_KEY": "model-key",
+		"env:MYSQL_DSN": "user:password@tcp(127.0.0.1:1)/missing?parseTime=true&charset=utf8mb4&loc=UTC",
+	}), "strong", "phase55", "redis://127.0.0.1:1/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	if err := provider.Ready(context.Background()); err != nil {
+		t.Fatalf("global readiness was lowered by SQL profile: %v", err)
+	}
+	mysqlProfile, _ := repository.GetStorageProfile(context.Background(), "tenant-mysql", "mysql-v1")
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if _, err := provider.BackendFor(ctx, mysqlProfile); err == nil {
+		t.Fatal("unavailable SQL profile unexpectedly initialized")
+	}
+	if err := provider.Ready(context.Background()); err != nil {
+		t.Fatalf("global readiness stayed degraded after SQL profile error: %v", err)
+	}
+}
+
 func providerCatalog() tenant.Catalog {
 	model := tenant.ModelConfig{
 		Name: "model", BaseURL: "https://example.test", CredentialRef: "env:MODEL_KEY",

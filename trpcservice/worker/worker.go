@@ -14,6 +14,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
 )
 
@@ -24,6 +25,11 @@ type Executor interface {
 
 type FencedExecutor interface {
 	ExecuteFenced(context.Context, message.ExecutionTask, sessionfence.Fence) (message.OutboundMessage, sessionfence.TurnCommit, error)
+}
+
+type PersistenceExecutor interface {
+	PersistenceRoute(context.Context, message.ExecutionTask) (persistence.Route, error)
+	Persist(context.Context, persistence.Envelope) error
 }
 
 type Worker struct {
@@ -83,6 +89,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			return nil
 		}
 		_, _ = w.store.PromoteRetries(runCtx, 32)
+		_, _ = w.store.PromotePersistenceRetries(runCtx, 32)
 		_, _ = w.store.PromoteSessionWait(runCtx, 32)
 		stale, err := w.store.ClaimStale(runCtx, w.consumer, 16)
 		if err == nil {
@@ -135,6 +142,10 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 		_ = w.store.Reject(context.Background(), delivery, "invalid_task")
 		return
 	}
+	if snapshot.State == messaging.StatePersisting {
+		w.processPersistenceDelivery(runCtx, delivery)
+		return
+	}
 	lease, err := w.store.Begin(runCtx, delivery, w.consumer)
 	if err != nil {
 		if errors.Is(err, messaging.ErrSessionBusy) || errors.Is(err, messaging.ErrSessionWait) {
@@ -166,10 +177,30 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 	var reply message.OutboundMessage
 	var executeErr error
 	var turnCommit sessionfence.TurnCommit
-	if fenced, ok := w.executor.(FencedExecutor); ok && w.store.Config().SessionFencing == "strong" {
-		reply, turnCommit, executeErr = fenced.ExecuteFenced(execCtx, delivery.Task, sessionfence.Fence{TaskID: delivery.Task.TaskID, SessionCoord: lease.SessionCoord, SessionSeq: lease.SessionSeq, LeaseEpoch: lease.Epoch, LockToken: lease.LockToken})
-	} else {
-		reply, executeErr = w.executor.Execute(execCtx, delivery.Task)
+	var route persistence.Route
+	var envelope persistence.Envelope
+	var persistenceErr error
+	persistentExecutor, hasPersistence := w.executor.(PersistenceExecutor)
+	if hasPersistence {
+		route, executeErr = persistentExecutor.PersistenceRoute(execCtx, delivery.Task)
+		if executeErr == nil {
+			executeErr = w.store.EnsureBackendFingerprint(execCtx, route)
+		}
+	}
+	if executeErr == nil {
+		if fenced, ok := w.executor.(FencedExecutor); ok && w.store.Config().SessionFencing == "strong" {
+			reply, turnCommit, executeErr = fenced.ExecuteFenced(execCtx, delivery.Task, sessionfence.Fence{TaskID: delivery.Task.TaskID, SessionCoord: lease.SessionCoord, SessionSeq: lease.SessionSeq, LeaseEpoch: lease.Epoch, LockToken: lease.LockToken})
+		} else {
+			reply, executeErr = w.executor.Execute(execCtx, delivery.Task)
+		}
+	}
+	if executeErr == nil && route.IsSQL() {
+		envelope, persistenceErr = w.store.PreparePersistence(execCtx, lease, route, reply, turnCommit)
+		if persistenceErr == nil {
+			persistCtx, persistCancel := context.WithTimeout(execCtx, w.store.Config().PersistenceTimeout)
+			persistenceErr = persistentExecutor.Persist(persistCtx, envelope)
+			persistCancel()
+		}
 	}
 	cancel()
 	heartbeatFailed := false
@@ -191,6 +222,24 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 	}
 	transitionCtx, transitionCancel := context.WithTimeout(context.Background(), transitionTimeout)
 	defer transitionCancel()
+	if executeErr == nil && w.store.Config().SessionFencing == "strong" && route.IsSQL() {
+		if turnCommit.SessionCoord == "" {
+			_ = w.store.Fail(transitionCtx, lease, "session_commit_invalid")
+			return
+		}
+		if persistenceErr != nil {
+			if envelope.TaskID == "" {
+				if errors.Is(persistenceErr, persistence.ErrInvalidEnvelope) {
+					_ = w.store.Fail(transitionCtx, lease, "persistence_envelope_invalid")
+				}
+				return
+			}
+			w.handlePersistenceFailure(transitionCtx, lease, envelope, persistenceErr)
+			return
+		}
+		_ = w.store.FinalizePersistence(transitionCtx, lease, envelope)
+		return
+	}
 	if runCtx.Err() != nil || errors.Is(executeErr, context.Canceled) {
 		w.retryOrFail(transitionCtx, lease, "worker_shutdown", true)
 		return
@@ -215,6 +264,75 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 		return
 	}
 	w.retryOrFail(transitionCtx, lease, code, false)
+}
+
+func (w *Worker) processPersistenceDelivery(runCtx context.Context, delivery messaging.Delivery) {
+	persistentExecutor, ok := w.executor.(PersistenceExecutor)
+	if !ok {
+		return
+	}
+	lease, envelope, err := w.store.BeginPersistence(runCtx, delivery, w.consumer)
+	if err != nil {
+		return
+	}
+	w.mu.Lock()
+	w.activeLease = &lease
+	w.mu.Unlock()
+	execCtx, cancel := context.WithCancel(runCtx)
+	heartbeatDone := make(chan error, 2)
+	go w.taskHeartbeat(execCtx, cancel, lease, heartbeatDone)
+	go w.sessionHeartbeat(execCtx, cancel, lease, heartbeatDone)
+	persistCtx, persistCancel := context.WithTimeout(execCtx, w.store.Config().PersistenceTimeout)
+	persistErr := persistentExecutor.Persist(persistCtx, envelope)
+	persistCancel()
+	cancel()
+	heartbeatFailed := false
+	for i := 0; i < 2; i++ {
+		heartbeatErr := <-heartbeatDone
+		if heartbeatErr != nil && !errors.Is(heartbeatErr, context.Canceled) {
+			heartbeatFailed = true
+		}
+	}
+	if heartbeatFailed {
+		return
+	}
+	transitionCtx, transitionCancel := context.WithTimeout(context.Background(), w.store.Config().PersistenceTimeout)
+	defer transitionCancel()
+	if persistErr == nil {
+		_ = w.store.FinalizePersistence(transitionCtx, lease, envelope)
+		return
+	}
+	w.handlePersistenceFailure(transitionCtx, lease, envelope, persistErr)
+}
+
+func (w *Worker) handlePersistenceFailure(ctx context.Context, lease messaging.Lease, envelope persistence.Envelope, persistErr error) {
+	code, retryable := classifyPersistence(persistErr)
+	if !retryable {
+		_ = w.store.FailPersistence(ctx, lease, envelope, code)
+		return
+	}
+	if envelope.PersistAttempt >= w.store.Config().PersistenceMaxAttempts {
+		_ = w.store.FailPersistence(ctx, lease, envelope, "persistence_retry_exhausted")
+		return
+	}
+	_, _ = w.store.DeferPersistence(ctx, lease, envelope, code)
+}
+
+func classifyPersistence(err error) (string, bool) {
+	switch {
+	case errors.Is(err, persistence.ErrFingerprintConflict):
+		return "backend_fingerprint_conflict", false
+	case errors.Is(err, persistence.ErrCommitDigestConflict):
+		return "sql_commit_digest_conflict", false
+	case errors.Is(err, persistence.ErrSessionSequenceConflict):
+		return "sql_session_sequence_conflict", false
+	case errors.Is(err, persistence.ErrInvalidEnvelope):
+		return "persistence_envelope_invalid", false
+	case errors.Is(err, persistence.ErrSchemaIncompatible):
+		return "sql_schema_incompatible", false
+	default:
+		return "sql_unavailable", true
+	}
 }
 
 func (w *Worker) taskHeartbeat(ctx context.Context, cancel context.CancelFunc, lease messaging.Lease, done chan<- error) {
@@ -276,6 +394,14 @@ func (w *Worker) releaseAfterAgentCancellation(lease messaging.Lease) {
 
 func classify(err error) (string, bool) {
 	switch {
+	case errors.Is(err, persistence.ErrFingerprintConflict):
+		return "backend_fingerprint_conflict", false
+	case errors.Is(err, persistence.ErrPostgresSummaryDisabled):
+		return "postgres_summary_disabled", false
+	case errors.Is(err, persistence.ErrSchemaIncompatible):
+		return "sql_schema_incompatible", false
+	case errors.Is(err, persistence.ErrBackendUnavailable):
+		return "sql_unavailable", true
 	case errors.Is(err, executor.ErrTurnTooLarge):
 		return "session_turn_too_large", false
 	case errors.Is(err, executor.ErrUnknownBinding), errors.Is(err, executor.ErrConfigurationUnavailable):

@@ -14,6 +14,7 @@ import (
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -25,7 +26,13 @@ type Backend interface {
 	Check(context.Context) error
 	Session() session.Service
 	Memory() frameworkmemory.Service
+	Fingerprint() persistence.BackendFingerprint
 	Close() error
+}
+
+type PersistentBackend interface {
+	Backend
+	Committer() persistence.Committer
 }
 
 type backendKey struct {
@@ -92,6 +99,26 @@ func (p *BackendProvider) SetTurnLimits(limits sessionfence.Limits) {
 // Redis network initialization remains lazy inside Ready and can recover on a
 // later call after a transient failure.
 func (p *BackendProvider) BackendFor(ctx context.Context, profile tenant.StorageProfile) (Backend, error) {
+	backend, err := p.backendWithoutReady(ctx, profile)
+	if err != nil {
+		return nil, err
+	}
+	if err := backend.Ready(ctx); err != nil {
+		return nil, fmt.Errorf("storage profile unavailable: %w", err)
+	}
+	return backend, nil
+}
+
+// BackendIdentityFor returns the parsed immutable identity without network I/O.
+func (p *BackendProvider) BackendIdentityFor(ctx context.Context, profile tenant.StorageProfile) (persistence.BackendFingerprint, error) {
+	backend, err := p.backendWithoutReady(ctx, profile)
+	if err != nil {
+		return persistence.BackendFingerprint{}, err
+	}
+	return backend.Fingerprint(), nil
+}
+
+func (p *BackendProvider) backendWithoutReady(ctx context.Context, profile tenant.StorageProfile) (Backend, error) {
 	authoritative, err := p.repository.GetStorageProfile(ctx, profile.TenantID, profile.ID)
 	if err != nil {
 		return nil, fmt.Errorf("storage profile lookup failed: %w", err)
@@ -114,9 +141,6 @@ func (p *BackendProvider) BackendFor(ctx context.Context, profile tenant.Storage
 		p.backends[key] = backend
 	}
 	p.mu.Unlock()
-	if err := backend.Ready(ctx); err != nil {
-		return nil, fmt.Errorf("storage profile unavailable: %w", err)
-	}
 	return backend, nil
 }
 
@@ -126,7 +150,9 @@ func (p *BackendProvider) newBackend(profile tenant.StorageProfile) (Backend, er
 		if p.sessionFencing == "strong" {
 			return nil, errors.New("strong session fencing rejects inmemory storage")
 		}
-		return NewInMemoryBackend(), nil
+		backend := NewInMemoryBackend()
+		backend.fingerprint.StorageProfileID = profile.ID
+		return backend, nil
 	case tenant.StorageKindRedis:
 		value, err := p.credentials.Resolve(profile.CredentialRef)
 		if err != nil {
@@ -146,10 +172,28 @@ func (p *BackendProvider) newBackend(profile tenant.StorageProfile) (Backend, er
 		if !profile.LegacyPrefix {
 			prefix += ":tenant:" + profile.TenantID + ":profile:" + profile.ID
 		}
+		var backend *RedisBackend
 		if p.sessionFencing == "strong" {
-			return NewFencedRedisBackendWithConfig(redisURL, prefix, p.turnLimits, p.messagingPrefix, p.messagingURL)
+			backend, err = NewFencedRedisBackendWithConfig(redisURL, prefix, p.turnLimits, p.messagingPrefix, p.messagingURL)
+		} else {
+			backend, err = NewRedisBackend(redisURL, prefix)
 		}
-		return NewRedisBackend(redisURL, prefix)
+		if err != nil {
+			return nil, err
+		}
+		fingerprintProfile := profile
+		fingerprintProfile.KeyPrefix = prefix
+		backend.fingerprint, err = persistence.FingerprintForProfile(fingerprintProfile, redisURL)
+		return backend, err
+	case tenant.StorageKindPostgres, tenant.StorageKindMySQL:
+		if p.sessionFencing != "strong" {
+			return nil, errors.New("SQL storage requires strong session fencing")
+		}
+		value, err := p.credentials.Resolve(profile.CredentialRef)
+		if err != nil {
+			return nil, errors.New("resolve SQL storage credential")
+		}
+		return NewSQLBackend(profile, value, p.turnLimits)
 	default:
 		return nil, errors.New("unsupported storage profile kind")
 	}
@@ -161,6 +205,9 @@ func (p *BackendProvider) Ready(ctx context.Context) error {
 		return fmt.Errorf("list active storage profiles: %w", err)
 	}
 	for _, profile := range profiles {
+		if profile.Kind.IsSQL() {
+			continue
+		}
 		if _, err := p.BackendFor(ctx, profile); err != nil {
 			return err
 		}
@@ -210,18 +257,22 @@ func (p *BackendProvider) Close() error {
 }
 
 type InMemoryBackend struct {
-	mu       sync.Mutex
-	closed   bool
-	sessions session.Service
-	memories frameworkmemory.Service
+	mu          sync.Mutex
+	closed      bool
+	sessions    session.Service
+	memories    frameworkmemory.Service
+	fingerprint persistence.BackendFingerprint
 }
 
 func NewInMemoryBackend() *InMemoryBackend {
 	return &InMemoryBackend{
-		sessions: sessioninmemory.NewSessionService(),
-		memories: memoryinmemory.NewMemoryService(),
+		sessions:    sessioninmemory.NewSessionService(),
+		memories:    memoryinmemory.NewMemoryService(),
+		fingerprint: persistence.BackendFingerprint{SchemaVersion: persistence.FingerprintSchemaVersion, Kind: tenant.StorageKindInMemory, StorageProfileID: "inmemory", Namespace: "process"},
 	}
 }
+
+func (b *InMemoryBackend) Fingerprint() persistence.BackendFingerprint { return b.fingerprint }
 
 func (b *InMemoryBackend) Ready(ctx context.Context) error { return b.Check(ctx) }
 

@@ -21,19 +21,33 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/keyspace"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/redistopology"
 )
 
 const (
-	StateQueued         = "queued"
-	StateProcessing     = "processing"
-	StateRetryWait      = "retry_wait"
-	StateSucceeded      = "succeeded"
-	StateFailedTerminal = "failed_terminal"
+	StateQueued           = "queued"
+	StateProcessing       = "processing"
+	StateRetryWait        = "retry_wait"
+	StatePersisting       = "persisting"
+	StatePersistRetryWait = "persist_retry_wait"
+	StateSucceeded        = "succeeded"
+	StateFailedTerminal   = "failed_terminal"
 
 	workerGroup  = "agent-workers-v1"
 	gatewayGroup = "agent-gateways-v1"
 )
+
+var ensureBackendFingerprintScript = redis.NewScript(`
+local current_type=redis.call('TYPE',KEYS[1]); if type(current_type)=='table' then current_type=current_type.ok end
+if current_type~='none' and current_type~='hash' then return -9 end
+if current_type=='none' then
+  redis.call('HSET',KEYS[1],'fingerprint_version',ARGV[1],'kind',ARGV[2],'storage_profile_id',ARGV[3],'database_identity',ARGV[4],'namespace',ARGV[5],'digest',ARGV[6])
+  return 1
+end
+if redis.call('HGET',KEYS[1],'fingerprint_version')~=ARGV[1] or redis.call('HGET',KEYS[1],'kind')~=ARGV[2] or redis.call('HGET',KEYS[1],'storage_profile_id')~=ARGV[3] or redis.call('HGET',KEYS[1],'database_identity')~=ARGV[4] or redis.call('HGET',KEYS[1],'namespace')~=ARGV[5] or redis.call('HGET',KEYS[1],'digest')~=ARGV[6] then return -1 end
+return 2
+`)
 
 var (
 	ErrConflict          = errors.New("message idempotency conflict")
@@ -49,21 +63,24 @@ var (
 )
 
 type Snapshot struct {
-	InboxKey     string
-	TaskID       string
-	Digest       string
-	State        string
-	Attempt      int
-	TraceID      string
-	RequestID    string
-	ErrorCode    string
-	Result       *message.TaskResult
-	RawPayload   string
-	SessionCoord string
-	SessionSeq   int64
-	Owner        string
-	LeaseEpoch   int64
-	LeaseUntil   int64
+	InboxKey       string
+	TaskID         string
+	Digest         string
+	State          string
+	Attempt        int
+	TraceID        string
+	RequestID      string
+	ErrorCode      string
+	Result         *message.TaskResult
+	RawPayload     string
+	SessionCoord   string
+	SessionSeq     int64
+	Owner          string
+	LeaseEpoch     int64
+	LeaseUntil     int64
+	RawEnvelope    string
+	EnvelopeDigest string
+	PersistAttempt int
 }
 
 func (s Snapshot) Terminal() bool {
@@ -97,17 +114,21 @@ type Store struct {
 	client *redis.Client
 	config config.MessagingConfig
 
-	basePrefix     string
-	taskStream     string
-	replyStream    string
-	retryKey       string
-	inboxPrefix    string
-	sessionWaitKey string
+	basePrefix          string
+	taskStream          string
+	replyStream         string
+	retryKey            string
+	persistenceRetryKey string
+	inboxPrefix         string
+	sessionWaitKey      string
 
 	mu        sync.RWMutex
 	closed    bool
 	closeOnce sync.Once
 	closeErr  error
+
+	fingerprintMu sync.RWMutex
+	fingerprints  map[string]string
 }
 
 func NewStore(cfg config.MessagingConfig) (*Store, error) {
@@ -132,6 +153,21 @@ func NewStore(cfg config.MessagingConfig) (*Store, error) {
 	if cfg.ShutdownTimeout == 0 {
 		cfg.ShutdownTimeout = config.DefaultShutdownTimeout
 	}
+	if cfg.PersistenceTimeout == 0 {
+		cfg.PersistenceTimeout = config.DefaultPersistenceTimeout
+	}
+	if cfg.PersistenceMaxAttempts == 0 {
+		cfg.PersistenceMaxAttempts = config.DefaultPersistenceMaxAttempts
+	}
+	if cfg.PersistenceInitialBackoff == 0 {
+		cfg.PersistenceInitialBackoff = config.DefaultPersistenceInitialBackoff
+	}
+	if cfg.PersistenceMaxBackoff == 0 {
+		cfg.PersistenceMaxBackoff = config.DefaultPersistenceMaxBackoff
+	}
+	if cfg.PersistencePayloadMaxBytes == 0 {
+		cfg.PersistencePayloadMaxBytes = config.DefaultPersistencePayloadMaxBytes
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -144,7 +180,9 @@ func NewStore(cfg config.MessagingConfig) (*Store, error) {
 		client: redis.NewClient(options), config: cfg, basePrefix: base,
 		taskStream: base + ":agent.tasks", replyStream: base + ":agent.replies",
 		retryKey: base + ":agent.retry", inboxPrefix: base + ":inbox:",
-		sessionWaitKey: keyspace.SessionWait(cfg.KeyPrefix),
+		persistenceRetryKey: keyspace.PersistenceRetry(cfg.KeyPrefix),
+		sessionWaitKey:      keyspace.SessionWait(cfg.KeyPrefix),
+		fingerprints:        make(map[string]string),
 	}, nil
 }
 
@@ -167,6 +205,44 @@ func (s *Store) Ready(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// EnsureBackendFingerprint creates the immutable tenant/Agent backend binding
+// on first use and rejects any later backend identity change.
+func (s *Store) EnsureBackendFingerprint(ctx context.Context, route persistence.Route) error {
+	if err := route.Validate(); err != nil {
+		return err
+	}
+	digest, err := route.Fingerprint.Digest()
+	if err != nil {
+		return err
+	}
+	cacheKey := route.TenantID + "\x00" + route.AgentAppID
+	s.fingerprintMu.RLock()
+	cached := s.fingerprints[cacheKey]
+	s.fingerprintMu.RUnlock()
+	if message.ConstantTimeDigestEqual(cached, digest) {
+		return nil
+	}
+	fingerprint := route.Fingerprint
+	result, err := ensureBackendFingerprintScript.Run(ctx, s.client,
+		[]string{keyspace.BackendFingerprint(s.config.KeyPrefix, route.TenantID, route.AgentAppID)},
+		fingerprint.SchemaVersion, string(fingerprint.Kind), fingerprint.StorageProfileID,
+		fingerprint.DatabaseIdentity, fingerprint.Namespace, digest).Int()
+	if err != nil {
+		return err
+	}
+	switch result {
+	case 1, 2:
+		s.fingerprintMu.Lock()
+		s.fingerprints[cacheKey] = digest
+		s.fingerprintMu.Unlock()
+		return nil
+	case -9:
+		return ErrKeyType
+	default:
+		return persistence.ErrFingerprintConflict
+	}
 }
 
 func createGroup(ctx context.Context, client *redis.Client, stream, group string) error {
@@ -248,6 +324,9 @@ func (s *Store) snapshotByKey(ctx context.Context, inboxKey string) (Snapshot, e
 	snapshot.SessionSeq, _ = strconv.ParseInt(values["session_seq"], 10, 64)
 	snapshot.LeaseEpoch, _ = strconv.ParseInt(values["lease_epoch"], 10, 64)
 	snapshot.LeaseUntil, _ = strconv.ParseInt(values["lease_until"], 10, 64)
+	snapshot.RawEnvelope = values["persistence_envelope"]
+	snapshot.EnvelopeDigest = values["envelope_digest"]
+	snapshot.PersistAttempt, _ = strconv.Atoi(values["persist_attempt"])
 	if snapshot.RawPayload != "" {
 		var storedTask message.ExecutionTask
 		if decodeStrictJSON(snapshot.RawPayload, &storedTask) == nil {
@@ -545,6 +624,23 @@ func (s *Store) PromoteRetries(ctx context.Context, limit int) (int, error) {
 	return promoted, err
 }
 
+func (s *Store) persistenceBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := s.config.PersistenceInitialBackoff
+	for current := 1; current < attempt && delay < s.config.PersistenceMaxBackoff; current++ {
+		if delay > s.config.PersistenceMaxBackoff/2 {
+			return s.config.PersistenceMaxBackoff
+		}
+		delay *= 2
+	}
+	if delay > s.config.PersistenceMaxBackoff {
+		return s.config.PersistenceMaxBackoff
+	}
+	return delay
+}
+
 func (s *Store) Complete(ctx context.Context, lease Lease, reply message.OutboundMessage) error {
 	if s.config.SessionFencing == "strong" {
 		return ErrLeaseLost
@@ -761,6 +857,9 @@ func (s *Store) Recover(ctx context.Context, delivery Delivery, currentConsumer 
 		snapshot, snapshotErr := s.snapshotByKey(ctx, inboxKey)
 		if snapshotErr != nil {
 			return snapshotErr
+		}
+		if snapshot.State == StatePersisting {
+			return s.recoverPersistence(ctx, delivery, consumer, now)
 		}
 		coord := snapshot.SessionCoord
 		if coord == "" {

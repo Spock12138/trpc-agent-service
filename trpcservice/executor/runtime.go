@@ -21,6 +21,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	platformmessage "github.com/liuzengh/trpc-agent-service/trpcservice/message"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/routing"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
@@ -152,6 +153,66 @@ func (r *Runtime) backendForBinding(ctx context.Context, channel, bindingID stri
 		return nil, err
 	}
 	return r.backends.BackendFor(ctx, profile)
+}
+
+// PersistenceRoute resolves the immutable storage identity selected by the
+// exact task config. Worker locks this route in Messaging Redis before running
+// the Agent so a later config edit cannot move an Agent App between backends.
+func (r *Runtime) PersistenceRoute(ctx context.Context, task platformmessage.ExecutionTask) (persistence.Route, error) {
+	r.lifecycle.RLock()
+	defer r.lifecycle.RUnlock()
+	if err := task.Validate(); err != nil {
+		return persistence.Route{}, ErrConfigurationUnavailable
+	}
+	binding, err := r.repository.ResolveBinding(ctx, task.Channel, task.ChannelBindingID)
+	if err != nil || binding.TenantID != task.TenantID || binding.AgentAppID != task.AgentAppID {
+		return persistence.Route{}, ErrUnknownBinding
+	}
+	configVersion, err := r.repository.GetConfigVersion(ctx, task.TenantID, task.AgentAppID, task.ConfigVersion)
+	if err != nil {
+		return persistence.Route{}, ErrConfigurationUnavailable
+	}
+	profile, err := r.repository.GetStorageProfile(ctx, task.TenantID, configVersion.StorageProfileID)
+	if err != nil {
+		return persistence.Route{}, ErrConfigurationUnavailable
+	}
+	fingerprint, err := r.backends.BackendIdentityFor(ctx, profile)
+	if err != nil {
+		return persistence.Route{}, fmt.Errorf("%w: selected storage identity unavailable", ErrConfigurationUnavailable)
+	}
+	route := persistence.Route{TenantID: task.TenantID, AgentAppID: task.AgentAppID, Fingerprint: fingerprint}
+	if err := route.Validate(); err != nil {
+		return persistence.Route{}, ErrConfigurationUnavailable
+	}
+	return route, nil
+}
+
+// Persist commits an already staged SQL turn without invoking the Agent.
+func (r *Runtime) Persist(ctx context.Context, envelope persistence.Envelope) error {
+	r.lifecycle.RLock()
+	defer r.lifecycle.RUnlock()
+	if err := envelope.Validate(); err != nil {
+		return err
+	}
+	profile, err := r.repository.GetStorageProfile(ctx, envelope.TenantID, envelope.StorageProfileID)
+	if err != nil || profile.Kind != envelope.BackendKind {
+		return ErrConfigurationUnavailable
+	}
+	backend, err := r.backends.BackendFor(ctx, profile)
+	if err != nil {
+		if errors.Is(err, persistence.ErrSchemaIncompatible) {
+			return persistence.ErrSchemaIncompatible
+		}
+		return persistence.ErrBackendUnavailable
+	}
+	if backend.Fingerprint() != envelope.BackendFingerprint {
+		return persistence.ErrFingerprintConflict
+	}
+	persistent, ok := backend.(storage.PersistentBackend)
+	if !ok || persistent.Committer() == nil {
+		return persistence.ErrBackendUnavailable
+	}
+	return persistent.Committer().Commit(ctx, envelope)
 }
 
 func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
@@ -301,9 +362,15 @@ func (r *Runtime) ExecuteFenced(ctx context.Context, task platformmessage.Execut
 	}
 	backend, err := r.backends.BackendFor(requestCtx, profile)
 	if err != nil {
+		if profile.Kind.IsSQL() {
+			if errors.Is(err, persistence.ErrSchemaIncompatible) {
+				return Reply{}, sessionfence.TurnCommit{}, persistence.ErrSchemaIncompatible
+			}
+			return Reply{}, sessionfence.TurnCommit{}, persistence.ErrBackendUnavailable
+		}
 		return Reply{}, sessionfence.TurnCommit{}, ErrDependencyUnavailable
 	}
-	svc, ok := backend.Session().(*sessionfence.Service)
+	svc, ok := backend.Session().(sessionfence.StagingSession)
 	if !ok {
 		return Reply{}, sessionfence.TurnCommit{}, errors.New("strong session fencing backend is unavailable")
 	}
@@ -325,6 +392,9 @@ func (r *Runtime) ExecuteFenced(ctx context.Context, task platformmessage.Execut
 		svc.Discard(turn)
 		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 			return Reply{}, sessionfence.TurnCommit{}, ErrAgentTimeout
+		}
+		if errors.Is(err, persistence.ErrPostgresSummaryDisabled) {
+			return Reply{}, sessionfence.TurnCommit{}, persistence.ErrPostgresSummaryDisabled
 		}
 		return Reply{}, sessionfence.TurnCommit{}, ErrAgentFailed
 	}

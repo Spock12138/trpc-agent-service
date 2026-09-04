@@ -73,6 +73,15 @@ type Fence struct {
 	LockToken    string
 }
 
+// StagingSession is implemented by Redis and SQL Session wrappers that read
+// committed history from their backend while staging the current turn in memory.
+type StagingSession interface {
+	session.Service
+	StartTurn(session.Key, Fence) *Turn
+	Prepare(*Turn) (TurnCommit, error)
+	Discard(*Turn)
+}
+
 type contextKey struct{}
 
 func WithTurn(ctx context.Context, turn *Turn) context.Context {
@@ -84,6 +93,119 @@ func turnFrom(ctx context.Context) *Turn {
 	}
 	t, _ := ctx.Value(contextKey{}).(*Turn)
 	return t
+}
+
+// CurrentTurn returns the staged turn carried by ctx, if any.
+func CurrentTurn(ctx context.Context) *Turn { return turnFrom(ctx) }
+
+// NewTurn creates a backend-neutral staging buffer.
+func NewTurn(key session.Key, fence Fence) *Turn {
+	return &Turn{TaskID: fence.TaskID, SessionCoord: fence.SessionCoord, UserCoord: fence.UserCoord, SessionSeq: fence.SessionSeq, LeaseEpoch: fence.LeaseEpoch, LockToken: fence.LockToken, SessionKey: key, Status: TurnActive, FinalState: make(session.StateMap), Bytes: 2}
+}
+
+// StageCreatedSession attaches a newly created Session to the active turn.
+func StageCreatedSession(ctx context.Context, key session.Key, sess *session.Session) error {
+	turn := turnFrom(ctx)
+	if turn == nil || sess == nil {
+		return ErrFencedSessionWriteUnsupported
+	}
+	turn.mu.Lock()
+	defer turn.mu.Unlock()
+	if turn.Status != TurnActive || turn.SessionKey != key {
+		return ErrSessionFenceLost
+	}
+	turn.BaseSession = sess.Clone()
+	turn.FinalState = sess.SnapshotState()
+	return nil
+}
+
+// StageSessionState records the final Session state without backend I/O.
+func StageSessionState(ctx context.Context, key session.Key, state session.StateMap) error {
+	turn := turnFrom(ctx)
+	if turn == nil {
+		return ErrFencedSessionWriteUnsupported
+	}
+	turn.mu.Lock()
+	defer turn.mu.Unlock()
+	if turn.Status != TurnActive || turn.SessionKey != key {
+		return ErrSessionFenceLost
+	}
+	turn.FinalState = cloneState(state)
+	return nil
+}
+
+// StageEvent appends one Event and updates the staged final state.
+func StageEvent(ctx context.Context, sess *session.Session, current *event.Event, limits Limits) error {
+	if sess == nil || current == nil {
+		return session.ErrNilSession
+	}
+	turn := turnFrom(ctx)
+	if turn == nil {
+		return ErrFencedSessionWriteUnsupported
+	}
+	copyEvent := *current
+	encoded, err := json.Marshal(copyEvent)
+	if err != nil {
+		return err
+	}
+	eventBytes := len(encoded)
+	turn.mu.Lock()
+	defer turn.mu.Unlock()
+	if turn.Status != TurnActive {
+		return ErrSessionFenceLost
+	}
+	if turn.SessionKey.AppName != sess.AppName || turn.SessionKey.UserID != sess.UserID || turn.SessionKey.SessionID != sess.ID {
+		return ErrFencedSessionWriteUnsupported
+	}
+	if turn.OverLimit {
+		return nil
+	}
+	separatorBytes := 0
+	if len(turn.Events) > 0 {
+		separatorBytes = 1
+	}
+	if len(turn.Events)+1 > limits.MaxTurnEvents || turn.Bytes+separatorBytes+eventBytes > limits.MaxTurnBytes {
+		turn.OverLimit = true
+		return nil
+	}
+	turn.Events = append(turn.Events, copyEvent)
+	turn.Bytes += separatorBytes + eventBytes
+	sess.EventMu.Lock()
+	sess.Events = append(sess.Events, copyEvent)
+	sess.EventMu.Unlock()
+	sess.ApplyEventStateDelta(current)
+	turn.FinalState = sess.SnapshotState()
+	return nil
+}
+
+// PrepareTurn freezes a staged turn for Redis or SQL persistence.
+func PrepareTurn(turn *Turn) (TurnCommit, error) {
+	if turn == nil {
+		return TurnCommit{}, ErrSessionFenceLost
+	}
+	turn.mu.Lock()
+	defer turn.mu.Unlock()
+	if turn.Status != TurnActive {
+		return TurnCommit{}, ErrSessionFenceLost
+	}
+	if turn.OverLimit {
+		return TurnCommit{}, ErrTurnTooLarge
+	}
+	commit := TurnCommit{SessionCoord: turn.SessionCoord, SessionSeq: turn.SessionSeq, Events: append([]event.Event(nil), turn.Events...), FinalState: cloneState(turn.FinalState), AppName: turn.SessionKey.AppName, UserID: turn.SessionKey.UserID, SessionID: turn.SessionKey.SessionID, UserCoord: keyspace.UserCoord(turn.SessionKey.AppName, turn.SessionKey.UserID)}
+	turn.Status = TurnPrepared
+	return commit, nil
+}
+
+// DiscardTurn makes a staged turn unusable and releases its payload.
+func DiscardTurn(turn *Turn) {
+	if turn == nil {
+		return
+	}
+	turn.mu.Lock()
+	defer turn.mu.Unlock()
+	turn.Status = TurnDiscarded
+	turn.Events = nil
+	turn.FinalState = nil
 }
 
 type Service struct {
@@ -130,7 +252,7 @@ func (s *Service) Ready(ctx context.Context) error {
 }
 
 func (s *Service) StartTurn(key session.Key, fence Fence) *Turn {
-	return &Turn{TaskID: fence.TaskID, SessionCoord: fence.SessionCoord, UserCoord: fence.UserCoord, SessionSeq: fence.SessionSeq, LeaseEpoch: fence.LeaseEpoch, LockToken: fence.LockToken, SessionKey: key, Status: TurnActive, FinalState: make(session.StateMap), Bytes: 2}
+	return NewTurn(key, fence)
 }
 
 func (t *Turn) IsOverLimit() bool {
@@ -155,14 +277,10 @@ func (s *Service) CreateSession(ctx context.Context, key session.Key, state sess
 	for _, opt := range options {
 		_ = opt
 	}
-	if t := turnFrom(ctx); t != nil {
-		t.mu.Lock()
-		defer t.mu.Unlock()
-		if t.Status != TurnActive || t.SessionKey != key {
-			return nil, ErrSessionFenceLost
+	if turnFrom(ctx) != nil {
+		if err := StageCreatedSession(ctx, key, sess); err != nil {
+			return nil, err
 		}
-		t.BaseSession = sess.Clone()
-		t.FinalState = sess.SnapshotState()
 		return sess, nil
 	}
 	return nil, ErrFencedSessionWriteUnsupported
@@ -372,66 +490,14 @@ func (s *Service) DeleteUserState(context.Context, session.UserKey, string) erro
 }
 
 func (s *Service) UpdateSessionState(ctx context.Context, key session.Key, state session.StateMap) error {
-	t := turnFrom(ctx)
-	if t == nil {
-		return ErrFencedSessionWriteUnsupported
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.Status != TurnActive {
-		return ErrSessionFenceLost
-	}
-	if t.SessionKey != key {
-		return ErrFencedSessionWriteUnsupported
-	}
-	t.FinalState = cloneState(state)
-	return nil
+	return StageSessionState(ctx, key, state)
 }
 
 func (s *Service) AppendEvent(ctx context.Context, sess *session.Session, e *event.Event, _ ...session.Option) error {
-	if sess == nil || e == nil {
-		return session.ErrNilSession
-	}
-	t := turnFrom(ctx)
-	if t == nil {
-		return ErrFencedSessionWriteUnsupported
-	}
-	copyEvent := *e
-	encoded, err := json.Marshal(copyEvent)
-	if err != nil {
-		return err
-	}
-	eventBytes := len(encoded)
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.Status != TurnActive {
-		return ErrSessionFenceLost
-	}
-	if t.SessionKey.AppName != sess.AppName || t.SessionKey.UserID != sess.UserID || t.SessionKey.SessionID != sess.ID {
-		return ErrFencedSessionWriteUnsupported
-	}
-	if t.OverLimit {
-		return nil
-	}
 	s.mu.RLock()
-	maxEvents, maxBytes := s.limits.MaxTurnEvents, s.limits.MaxTurnBytes
+	limits := s.limits
 	s.mu.RUnlock()
-	separatorBytes := 0
-	if len(t.Events) > 0 {
-		separatorBytes = 1
-	}
-	if len(t.Events)+1 > maxEvents || t.Bytes+separatorBytes+eventBytes > maxBytes {
-		t.OverLimit = true
-		return nil
-	}
-	t.Events = append(t.Events, copyEvent)
-	t.Bytes += separatorBytes + eventBytes
-	sess.EventMu.Lock()
-	sess.Events = append(sess.Events, copyEvent)
-	sess.EventMu.Unlock()
-	sess.ApplyEventStateDelta(e)
-	t.FinalState = sess.SnapshotState()
-	return nil
+	return StageEvent(ctx, sess, e, limits)
 }
 
 func (s *Service) CreateSessionSummary(context.Context, *session.Session, string, bool) error {
@@ -447,29 +513,10 @@ func (s *Service) GetSessionSummaryText(context.Context, *session.Session, ...se
 // Prepare returns a staged commit without writing Redis. The messaging store
 // uses this form to atomically commit Session and Inbox state in one Lua call.
 func (s *Service) Prepare(turn *Turn) (TurnCommit, error) {
-	if turn == nil {
-		return TurnCommit{}, ErrSessionFenceLost
-	}
-	turn.mu.Lock()
-	defer turn.mu.Unlock()
-	if turn.Status != TurnActive {
-		return TurnCommit{}, ErrSessionFenceLost
-	}
-	if turn.OverLimit {
-		return TurnCommit{}, ErrTurnTooLarge
-	}
-	commit := TurnCommit{SessionCoord: turn.SessionCoord, SessionSeq: turn.SessionSeq, Events: append([]event.Event(nil), turn.Events...), FinalState: cloneState(turn.FinalState), AppName: turn.SessionKey.AppName, UserID: turn.SessionKey.UserID, SessionID: turn.SessionKey.SessionID, UserCoord: keyspace.UserCoord(turn.SessionKey.AppName, turn.SessionKey.UserID)}
-	turn.Status = TurnPrepared
-	return commit, nil
+	return PrepareTurn(turn)
 }
 func (s *Service) Discard(turn *Turn) {
-	if turn != nil {
-		turn.mu.Lock()
-		defer turn.mu.Unlock()
-		turn.Status = TurnDiscarded
-		turn.Events = nil
-		turn.FinalState = nil
-	}
+	DiscardTurn(turn)
 }
 
 func (s *Service) Close() error {
@@ -514,3 +561,4 @@ func cloneState(in session.StateMap) session.StateMap {
 }
 
 var _ session.Service = (*Service)(nil)
+var _ StagingSession = (*Service)(nil)

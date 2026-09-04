@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -26,7 +27,24 @@ type StorageKind string
 const (
 	StorageKindInMemory StorageKind = "inmemory"
 	StorageKindRedis    StorageKind = "redis"
+	StorageKindPostgres StorageKind = "postgres"
+	StorageKindMySQL    StorageKind = "mysql"
 )
+
+func (k StorageKind) IsSQL() bool {
+	return k == StorageKindPostgres || k == StorageKindMySQL
+}
+
+const (
+	// The pinned SQL modules embed table prefixes (and, for PostgreSQL,
+	// schemas) into index names. These limits keep their longest generated
+	// index, idx_*_session_summaries_unique_active, within the database
+	// identifier limit instead of letting it be silently truncated.
+	MaxSQLTablePrefixBytes         = 29
+	maxPostgresIndexNamespaceBytes = 27
+)
+
+var sqlIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type Tenant struct {
 	ID      string `json:"id"`
@@ -75,7 +93,63 @@ type StorageProfile struct {
 	Kind          StorageKind `json:"kind"`
 	CredentialRef string      `json:"credential_ref,omitempty"`
 	KeyPrefix     string      `json:"key_prefix,omitempty"`
+	TablePrefix   string      `json:"table_prefix,omitempty"`
+	Schema        string      `json:"schema,omitempty"`
+	SkipDBInit    bool        `json:"skip_db_init,omitempty"`
 	LegacyPrefix  bool        `json:"-"`
+}
+
+// NormalizeStorageProfile validates kind-specific fields and returns the
+// canonical immutable form used by BackendProvider and backend fingerprints.
+func NormalizeStorageProfile(profile StorageProfile) (StorageProfile, error) {
+	profile.CredentialRef = strings.TrimSpace(profile.CredentialRef)
+	profile.KeyPrefix = strings.TrimSpace(profile.KeyPrefix)
+	profile.TablePrefix = strings.TrimSpace(profile.TablePrefix)
+	profile.Schema = strings.TrimSpace(profile.Schema)
+	switch profile.Kind {
+	case StorageKindInMemory:
+		if profile.CredentialRef != "" || profile.KeyPrefix != "" || profile.TablePrefix != "" || profile.Schema != "" || profile.SkipDBInit {
+			return StorageProfile{}, fmt.Errorf("inmemory storage profile %q must not configure backend fields", profile.ID)
+		}
+	case StorageKindRedis:
+		if profile.CredentialRef == "" || strings.Trim(profile.KeyPrefix, ":") == "" {
+			return StorageProfile{}, fmt.Errorf("redis storage profile %q requires credential_ref and key_prefix", profile.ID)
+		}
+		if profile.TablePrefix != "" || profile.Schema != "" || profile.SkipDBInit {
+			return StorageProfile{}, fmt.Errorf("redis storage profile %q must not configure SQL fields", profile.ID)
+		}
+	case StorageKindPostgres, StorageKindMySQL:
+		if profile.CredentialRef == "" || profile.TablePrefix == "" {
+			return StorageProfile{}, fmt.Errorf("SQL storage profile %q requires credential_ref and table_prefix", profile.ID)
+		}
+		if profile.KeyPrefix != "" || profile.LegacyPrefix {
+			return StorageProfile{}, fmt.Errorf("SQL storage profile %q must not configure Redis fields", profile.ID)
+		}
+		if !sqlIdentifierPattern.MatchString(profile.TablePrefix) {
+			return StorageProfile{}, fmt.Errorf("SQL storage profile %q has invalid table_prefix", profile.ID)
+		}
+		if !strings.HasSuffix(profile.TablePrefix, "_") {
+			profile.TablePrefix += "_"
+		}
+		if profile.Kind == StorageKindPostgres {
+			if profile.Schema == "" {
+				profile.Schema = "public"
+			}
+			if !sqlIdentifierPattern.MatchString(profile.Schema) || len(profile.Schema) > 63 {
+				return StorageProfile{}, fmt.Errorf("postgres storage profile %q has invalid schema", profile.ID)
+			}
+			if len(profile.Schema)+len(profile.TablePrefix) > maxPostgresIndexNamespaceBytes {
+				return StorageProfile{}, fmt.Errorf("postgres storage profile %q schema and table_prefix are too long for official indexes", profile.ID)
+			}
+		} else if profile.Schema != "" {
+			return StorageProfile{}, fmt.Errorf("mysql storage profile %q must not configure schema", profile.ID)
+		} else if len(profile.TablePrefix) > MaxSQLTablePrefixBytes {
+			return StorageProfile{}, fmt.Errorf("mysql storage profile %q table_prefix exceeds %d bytes", profile.ID, MaxSQLTablePrefixBytes)
+		}
+	default:
+		return StorageProfile{}, fmt.Errorf("storage profile %q has unsupported kind", profile.ID)
+	}
+	return profile, nil
 }
 
 type Catalog struct {
@@ -160,17 +234,9 @@ func NewPresetRepository(catalog Catalog) (*PresetRepository, error) {
 		if _, exists := r.tenants[current.TenantID]; !exists {
 			return nil, fmt.Errorf("storage profile %q references unknown tenant", current.ID)
 		}
-		switch current.Kind {
-		case StorageKindInMemory:
-			if current.CredentialRef != "" || current.KeyPrefix != "" {
-				return nil, fmt.Errorf("inmemory storage profile %q must not configure redis credentials or prefix", current.ID)
-			}
-		case StorageKindRedis:
-			if strings.TrimSpace(current.CredentialRef) == "" || strings.Trim(strings.TrimSpace(current.KeyPrefix), ":") == "" {
-				return nil, fmt.Errorf("redis storage profile %q requires credential_ref and key_prefix", current.ID)
-			}
-		default:
-			return nil, fmt.Errorf("storage profile %q has unsupported kind", current.ID)
+		current, err := NormalizeStorageProfile(current)
+		if err != nil {
+			return nil, err
 		}
 		key := profileKey{tenantID: current.TenantID, profileID: current.ID}
 		if _, exists := r.profiles[key]; exists {
