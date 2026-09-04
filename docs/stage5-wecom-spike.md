@@ -28,7 +28,9 @@ wss://openws.work.weixin.qq.com
 }
 ```
 
-响应必须为相同 `cmd/req_id`，且 `body.errcode=0`。认证失败、超时和协议不匹配使 Adapter not ready，进程保持存活并有界退避重连。
+订阅响应无 `cmd` 字段：`headers.req_id` 透传请求值，顶层 `errcode=0` / `errmsg=ok` 表示成功（官方文档 path/101463「订阅请求」）。认证失败、超时和协议不匹配使 Adapter not ready，进程保持存活并有界退避重连。
+
+> 修正备注（2026-09-04，DeepSeek 复核修正）：初版按 `cmd` + `body.errcode` 解析，属误读官方文档响应格式；真实企微 smoke 实测响应为顶层 `errcode`，与官方文档一致。代码已改为双格式兼容并补契约测试。
 
 文本回调：
 
