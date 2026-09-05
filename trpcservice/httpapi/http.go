@@ -14,9 +14,11 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/redaction"
 )
 
 const (
@@ -33,12 +35,13 @@ type Backend interface {
 func NewHandler(backend Backend) http.Handler {
 	mux := http.NewServeMux()
 	registerHealth(mux, backend)
-	mux.HandleFunc("/api/v1/demo/messages", messageHandler(backend))
+	digestV2 := traceDigestV2Enabled(backend)
+	mux.HandleFunc("/api/v1/demo/messages", messageHandler(backend, digestV2))
 	if async, ok := backend.(interface {
 		Accept(context.Context, message.InboundMessage) (channels.AcceptResult, error)
 		Snapshot(context.Context, string, string, string) (messaging.Snapshot, error)
 	}); ok {
-		mux.HandleFunc("/api/v1/web/messages", webMessageHandler(async))
+		mux.HandleFunc("/api/v1/web/messages", webMessageHandler(async, digestV2))
 		mux.HandleFunc("/api/v1/web/messages/", webSnapshotHandler(async))
 		mux.Handle("/", webUIHandler())
 	}
@@ -58,7 +61,7 @@ type webMessageRequest struct {
 	Text           string `json:"text"`
 }
 
-func webMessageHandler(backend asyncBackend) http.HandlerFunc {
+func webMessageHandler(backend asyncBackend, digestV2 bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "", "")
@@ -91,7 +94,7 @@ func webMessageHandler(backend asyncBackend) http.HandlerFunc {
 		result, err := backend.Accept(r.Context(), message.InboundMessage{
 			Channel: "demo", BindingID: input.BindingID, PlatformMessageID: input.MessageID, ActorUserID: input.ExternalUserID,
 			ConversationID: input.ConversationID, ConversationType: message.ConversationDirect, Text: input.Text,
-			RequestID: requestID, TraceID: traceID, ReceivedAt: time.Now().UTC(),
+			RequestID: requestID, TraceID: traceID, TraceParent: gatedTraceParent(r, digestV2), ReceivedAt: time.Now().UTC(),
 		})
 		if err != nil {
 			writeMappedError(w, err, requestID, traceID)
@@ -218,7 +221,7 @@ type messageRequest struct {
 	Text           string `json:"text"`
 }
 
-func messageHandler(backend Backend) http.HandlerFunc {
+func messageHandler(backend Backend, digestV2 bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		requestID, err := identity.RequestID()
 		if err != nil {
@@ -263,6 +266,7 @@ func messageHandler(backend Backend) http.HandlerFunc {
 			Text:           input.Text,
 			RequestID:      requestID,
 			TraceID:        traceID,
+			TraceParent:    gatedTraceParent(r, digestV2),
 			ReceivedAt:     time.Now().UTC(),
 		})
 		if err != nil {
@@ -274,6 +278,37 @@ func messageHandler(backend Backend) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, reply)
 	}
+}
+
+func traceDigestV2Enabled(backend any) bool {
+	capability, ok := backend.(interface{ TraceDigestV2Enabled() bool })
+	return ok && capability.TraceDigestV2Enabled()
+}
+
+func gatedTraceParent(r *http.Request, digestV2 bool) string {
+	if !digestV2 {
+		return ""
+	}
+	return validTraceParent(r.Header.Get("traceparent"))
+}
+
+func validTraceParent(value string) string {
+	value = strings.TrimSpace(value)
+	parts := strings.Split(value, "-")
+	if len(parts) != 4 || len(parts[0]) != 2 || len(parts[1]) != 32 || len(parts[2]) != 16 || len(parts[3]) != 2 {
+		return ""
+	}
+	for _, part := range parts {
+		for _, current := range part {
+			if !((current >= '0' && current <= '9') || (current >= 'a' && current <= 'f') || (current >= 'A' && current <= 'F')) {
+				return ""
+			}
+		}
+	}
+	if strings.Trim(parts[1], "0") == "" || strings.Trim(parts[2], "0") == "" || strings.EqualFold(parts[3], "00") {
+		return ""
+	}
+	return strings.ToLower(value)
 }
 
 func validate(input messageRequest) error {
@@ -310,6 +345,12 @@ func writeMappedError(w http.ResponseWriter, err error, requestID, traceID strin
 		status, code, message = http.StatusServiceUnavailable, "not_ready", "service dependency unavailable"
 	case errors.Is(err, executor.ErrUnknownBinding):
 		status, code, message = http.StatusNotFound, "binding_not_found", "binding not found"
+	case errors.Is(err, governance.ErrActorForbidden):
+		status, code, message = http.StatusForbidden, "actor_forbidden", "actor is not authorized"
+	case errors.Is(err, governance.ErrPolicyMissing):
+		status, code, message = http.StatusServiceUnavailable, "tenant_policy_missing", "tenant policy is unavailable"
+	case errors.Is(err, governance.ErrPolicyUnavailable):
+		status, code, message = http.StatusServiceUnavailable, "tenant_policy_unavailable", "tenant policy is unavailable"
 	case errors.Is(err, executor.ErrRunnerDraining), errors.Is(err, executor.ErrConfigurationUnavailable), errors.Is(err, executor.ErrDependencyUnavailable):
 		status, code, message = http.StatusServiceUnavailable, "not_ready", "service dependency unavailable"
 	case errors.Is(err, executor.ErrAgentTimeout):
@@ -325,7 +366,7 @@ func writeMappedError(w http.ResponseWriter, err error, requestID, traceID strin
 func writeError(w http.ResponseWriter, status int, code, message, requestID, traceID string) {
 	writeJSON(w, status, map[string]string{
 		"code":       code,
-		"message":    message,
+		"message":    redaction.Default.Redact(message),
 		"request_id": requestID,
 		"trace_id":   traceID,
 	})

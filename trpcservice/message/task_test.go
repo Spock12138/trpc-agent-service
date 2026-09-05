@@ -62,6 +62,19 @@ func TestDeliveryTargetComesFromExecutionTask(t *testing.T) {
 	}
 }
 
+func TestCanonicalDigestV2RequiresTraceParent(t *testing.T) {
+	task := validTaskV2()
+	legacy := task.CanonicalDigest()
+	task.DigestVersion = 2
+	if task.CanonicalDigest() != legacy {
+		t.Fatal("v2 digest changed without a trace parent")
+	}
+	task.TraceParent = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+	if task.CanonicalDigest() == legacy {
+		t.Fatal("trace parent was not included in v2 digest")
+	}
+}
+
 func validTaskV2() ExecutionTask {
 	task := ExecutionTask{
 		SchemaVersion: TaskSchemaVersion, TaskID: "task-a", Channel: "telegram", ChannelBindingID: "binding-a", ExternalAccountID: "account-a",

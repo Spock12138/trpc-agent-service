@@ -54,14 +54,16 @@ type Turn struct {
 }
 
 type TurnCommit struct {
-	SessionCoord string
-	SessionSeq   int64
-	Events       []event.Event
-	FinalState   session.StateMap
-	AppName      string
-	UserID       string
-	SessionID    string
-	UserCoord    string
+	SessionCoord  string
+	SessionSeq    int64
+	Events        []event.Event
+	FinalState    session.StateMap
+	AppName       string
+	UserID        string
+	SessionID     string
+	UserCoord     string
+	TraceParent   string `json:"trace_parent,omitempty"`
+	DigestVersion int    `json:"digest_version,omitempty"`
 }
 
 type Fence struct {

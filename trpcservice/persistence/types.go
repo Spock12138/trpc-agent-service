@@ -93,6 +93,8 @@ type Envelope struct {
 	PreparedAt         time.Time               `json:"prepared_at"`
 	EnvelopeDigest     string                  `json:"envelope_digest"`
 	PersistAttempt     int                     `json:"persist_attempt"`
+	TraceParent        string                  `json:"trace_parent,omitempty"`
+	DigestVersion      int                     `json:"digest_version,omitempty"`
 }
 
 func NewEnvelope(task message.ExecutionTask, route Route, commit sessionfence.TurnCommit, reply message.OutboundMessage, preparedAt time.Time) (Envelope, error) {
@@ -102,6 +104,7 @@ func NewEnvelope(task message.ExecutionTask, route Route, commit sessionfence.Tu
 		StorageProfileID: route.Fingerprint.StorageProfileID, BackendKind: route.Fingerprint.Kind,
 		BackendFingerprint: route.Fingerprint, SessionCoord: commit.SessionCoord, SessionSeq: commit.SessionSeq,
 		TurnCommit: commit, Reply: reply, PreparedAt: preparedAt.UTC(), PersistAttempt: 1,
+		TraceParent: task.TraceParent, DigestVersion: task.DigestVersion,
 	}
 	digest, err := e.CalculateDigest()
 	if err != nil {
@@ -137,6 +140,9 @@ func (e Envelope) Validate() error {
 		return ErrInvalidEnvelope
 	}
 	if e.TurnCommit.SessionCoord != e.SessionCoord || e.TurnCommit.SessionSeq != e.SessionSeq || e.TurnCommit.AppName == "" || e.TurnCommit.UserID == "" || e.TurnCommit.SessionID == "" {
+		return ErrInvalidEnvelope
+	}
+	if e.TurnCommit.TraceParent != e.TraceParent || e.TurnCommit.DigestVersion != e.DigestVersion {
 		return ErrInvalidEnvelope
 	}
 	digest, err := e.CalculateDigest()

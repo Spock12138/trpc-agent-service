@@ -15,6 +15,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
 )
@@ -23,6 +24,13 @@ type fakeBackend struct {
 	readyErr error
 	handle   func(context.Context, executor.Request) (executor.Reply, error)
 }
+
+type traceBackend struct {
+	fakeBackend
+	digestV2 bool
+}
+
+func (f traceBackend) TraceDigestV2Enabled() bool { return f.digestV2 }
 
 type fakeAsyncBackend struct {
 	accepted message.InboundMessage
@@ -79,6 +87,36 @@ func TestMessageHandlerSuccessAndIDs(t *testing.T) {
 	}
 }
 
+func TestMessageHandlerGatesTraceParentByDigestV2(t *testing.T) {
+	const traceParent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+	for _, test := range []struct {
+		name    string
+		enabled bool
+		want    string
+	}{
+		{name: "disabled", enabled: false},
+		{name: "enabled", enabled: true, want: traceParent},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var received message.InboundMessage
+			backend := traceBackend{digestV2: test.enabled, fakeBackend: fakeBackend{handle: func(_ context.Context, req executor.Request) (executor.Reply, error) {
+				received = req
+				return executor.Reply{RequestID: req.RequestID, TraceID: req.TraceID, SessionID: "session", Text: "ok"}, nil
+			}}}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/demo/messages", strings.NewReader(`{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`))
+			req.Header.Set("traceparent", traceParent)
+			rec := httptest.NewRecorder()
+			NewHandler(backend).ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			if received.TraceParent != test.want {
+				t.Fatalf("trace parent = %q, want %q", received.TraceParent, test.want)
+			}
+		})
+	}
+}
+
 func TestMessageHandlerValidationAndErrorMapping(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -95,6 +133,8 @@ func TestMessageHandlerValidationAndErrorMapping(t *testing.T) {
 		{name: "multiple objects", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"} {}`, status: http.StatusBadRequest},
 		{name: "body too large", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"` + strings.Repeat("x", maxBodyBytes) + `"}`, status: http.StatusBadRequest},
 		{name: "unknown binding", input: `{"binding_id":"other","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrUnknownBinding, status: http.StatusNotFound},
+		{name: "actor forbidden", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: governance.ErrActorForbidden, status: http.StatusForbidden},
+		{name: "policy missing", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: governance.ErrPolicyMissing, status: http.StatusServiceUnavailable},
 		{name: "dependency unavailable", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrDependencyUnavailable, status: http.StatusServiceUnavailable},
 		{name: "configuration unavailable", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrConfigurationUnavailable, status: http.StatusServiceUnavailable},
 		{name: "runner draining", input: `{"binding_id":"demo-binding","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`, err: executor.ErrRunnerDraining, status: http.StatusServiceUnavailable},

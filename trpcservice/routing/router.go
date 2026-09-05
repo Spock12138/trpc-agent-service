@@ -22,6 +22,7 @@ var (
 type Router struct {
 	repository     tenant.Repository
 	identitySecret []byte
+	digestV2       bool
 }
 
 func (r *Router) InboxID(ctx context.Context, channel, bindingID, platformMessageID string) (string, error) {
@@ -39,13 +40,21 @@ func (r *Router) InboxID(ctx context.Context, channel, bindingID, platformMessag
 }
 
 func New(repository tenant.Repository, identitySecret []byte) (*Router, error) {
+	return NewWithDigestV2(repository, identitySecret, false)
+}
+
+func NewWithDigestV2(repository tenant.Repository, identitySecret []byte, enabled bool) (*Router, error) {
 	if repository == nil {
 		return nil, errors.New("tenant repository is required")
 	}
 	if len(identitySecret) == 0 {
 		return nil, errors.New("identity secret is required")
 	}
-	return &Router{repository: repository, identitySecret: append([]byte(nil), identitySecret...)}, nil
+	return &Router{repository: repository, identitySecret: append([]byte(nil), identitySecret...), digestV2: enabled}, nil
+}
+
+func (r *Router) TraceDigestV2Enabled() bool {
+	return r != nil && r.digestV2
 }
 
 func (r *Router) Resolve(ctx context.Context, inbound message.InboundMessage) (message.ExecutionTask, error) {
@@ -140,6 +149,17 @@ func (r *Router) Resolve(ctx context.Context, inbound message.InboundMessage) (m
 		TraceID:           traceID,
 		ReceivedAt:        receivedAt,
 		Attempt:           1,
+	}
+	if r.digestV2 {
+		task.TraceParent = inbound.TraceParent
+		task.DigestVersion = 2
+		if task.TraceParent == "" {
+			spanID, spanErr := identity.RequestID()
+			if spanErr != nil {
+				return message.ExecutionTask{}, fmt.Errorf("create trace parent: %w", spanErr)
+			}
+			task.TraceParent = "00-" + traceID + "-" + spanID + "-01"
+		}
 	}
 	task.PayloadDigest = task.CanonicalDigest()
 	if err := task.Validate(); err != nil {

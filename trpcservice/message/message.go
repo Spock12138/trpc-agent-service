@@ -32,6 +32,8 @@ type InboundMessage struct {
 	Text              string
 	RequestID         string
 	TraceID           string
+	TraceParent       string
+	DigestVersion     int
 	ReceivedAt        time.Time
 	PlatformRequestID string // Adapter correlation data, for example WeCom req_id.
 }
@@ -74,6 +76,8 @@ type OutboundMessage struct {
 	PlatformRequestID string           `json:"-"`
 	RequestID         string           `json:"request_id"`
 	TraceID           string           `json:"trace_id"`
+	TraceParent       string           `json:"trace_parent,omitempty"`
+	DigestVersion     int              `json:"digest_version,omitempty"`
 	SessionID         string           `json:"session_id"`
 	Text              string           `json:"text"`
 }

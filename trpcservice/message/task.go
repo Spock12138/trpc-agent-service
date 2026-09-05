@@ -37,6 +37,8 @@ type ExecutionTask struct {
 	Text              string           `json:"text"`
 	RequestID         string           `json:"request_id"`
 	TraceID           string           `json:"trace_id"`
+	TraceParent       string           `json:"trace_parent,omitempty"`
+	DigestVersion     int              `json:"digest_version,omitempty"`
 	ReceivedAt        time.Time        `json:"received_at"`
 	Attempt           int              `json:"attempt"`
 	PayloadDigest     string           `json:"payload_digest"`
@@ -52,6 +54,8 @@ type TaskResult struct {
 	Reply         OutboundMessage `json:"reply,omitempty"`
 	ErrorCode     string          `json:"error_code,omitempty"`
 	TraceID       string          `json:"trace_id"`
+	TraceParent   string          `json:"trace_parent,omitempty"`
+	DigestVersion int             `json:"digest_version,omitempty"`
 }
 
 func (r TaskResult) Validate() error {
@@ -89,7 +93,7 @@ func (t ExecutionTask) DeliveryTarget() DeliveryTarget {
 }
 
 func (t ExecutionTask) CanonicalDigest() string {
-	return digestParts(
+	parts := []string{
 		t.Channel,
 		t.ChannelBindingID,
 		t.ExternalAccountID,
@@ -105,7 +109,11 @@ func (t ExecutionTask) CanonicalDigest() string {
 		t.ReplyToMessageID,
 		t.PlatformRequestID,
 		t.Text,
-	)
+	}
+	if t.DigestVersion >= 2 && t.TraceParent != "" {
+		parts = append([]string{"phase6-digest-v2", t.TraceParent}, parts...)
+	}
+	return digestParts(parts...)
 }
 
 func (t ExecutionTask) ValidDigest() bool {
