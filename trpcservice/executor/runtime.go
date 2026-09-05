@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	openaioption "github.com/openai/openai-go/option"
 	frameworkagent "trpc.group/trpc-go/trpc-agent-go/agent"
@@ -20,12 +21,17 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/control"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	platformmessage "github.com/liuzengh/trpc-agent-service/trpcservice/message"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/routing"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
+	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
 var (
@@ -49,6 +55,14 @@ type Runtime struct {
 	router         *routing.Router
 	backends       *storage.BackendProvider
 	registry       *agent.RunnerRegistry
+	catalogTenants []tenant.Tenant
+	controlRepo    control.Repository
+	policyCache    *governance.PolicyCache
+	policyEnforcer *governance.PolicyEnforcer
+	confirmations  *governance.ConfirmationManager
+	auditSink      *metrics.AsyncAuditSink
+	policyWarmMu   sync.Mutex
+	policyWarmed   bool
 
 	lifecycle sync.RWMutex
 	closeOnce sync.Once
@@ -86,25 +100,62 @@ func New(cfg config.Config) (*Runtime, error) {
 		backends,
 		credentials,
 		agent.DefaultCacheConfig(),
-		newRunner,
+		func(ctx context.Context, key agent.CacheKey, configVersion tenant.ConfigVersion, apiKey string, sessions session.Service, memories memory.Service) (frameworkrunner.Runner, error) {
+			if cfg.ControlPlane == nil {
+				return newRunner(ctx, key, configVersion, apiKey, sessions, memories)
+			}
+			return newGovernedRunner(ctx, key, configVersion, apiKey, sessions, memories)
+		},
 	)
 	if err != nil {
 		_ = backends.Close()
 		return nil, err
 	}
-	router, err := routing.New(repository, cfg.IdentitySecret)
+	router, err := routing.NewWithDigestV2(repository, cfg.IdentitySecret, cfg.ControlPlane != nil && cfg.ControlPlane.TraceDigestV2Enabled)
 	if err != nil {
 		_ = registry.Close()
 		_ = backends.Close()
 		return nil, err
 	}
-	return &Runtime{
+	runtime := &Runtime{
 		identitySecret: append([]byte(nil), cfg.IdentitySecret...),
 		repository:     repository,
 		router:         router,
 		backends:       backends,
 		registry:       registry,
-	}, nil
+		catalogTenants: append([]tenant.Tenant(nil), catalog.Tenants...),
+	}
+	if cfg.ControlPlane != nil {
+		rawControl, err := control.NewRedisRepository(*cfg.ControlPlane)
+		if err != nil {
+			_ = registry.Close()
+			_ = backends.Close()
+			return nil, err
+		}
+		defaultTools := platformtool.NewRegistry().NonDangerousNames()
+		controlRepo := control.NewInitializingRepository(rawControl, catalog.Tenants, defaultTools)
+		cache, err := governance.NewPolicyCache(controlRepo, cfg.ControlPlane.PolicyCacheTTL)
+		if err != nil {
+			_ = rawControl.Close()
+			_ = registry.Close()
+			_ = backends.Close()
+			return nil, err
+		}
+		confirmations, err := governance.NewConfirmationManager(controlRepo, 5*time.Minute, cfg.IdentitySecret)
+		if err != nil {
+			_ = rawControl.Close()
+			_ = registry.Close()
+			_ = backends.Close()
+			return nil, err
+		}
+		runtime.controlRepo = controlRepo
+		runtime.policyCache = cache
+		runtime.auditSink = metrics.NewAuditSink(controlRepo, 256)
+		runtime.policyEnforcer = governance.NewPolicyEnforcer(cache, cfg.IdentitySecret, controlRepo)
+		runtime.policyEnforcer.SetAuditSink(runtime.auditSink)
+		runtime.confirmations = confirmations
+	}
+	return runtime, nil
 }
 
 func newRunner(
@@ -126,13 +177,85 @@ func newRunner(
 	), nil
 }
 
+func newGovernedRunner(
+	ctx context.Context,
+	key agent.CacheKey,
+	configVersion tenant.ConfigVersion,
+	apiKey string,
+	sessions session.Service,
+	memories memory.Service,
+) (frameworkrunner.Runner, error) {
+	if key.TenantID != configVersion.TenantID || key.AgentAppID != configVersion.AgentAppID || key.ConfigVersion != configVersion.Version {
+		return nil, errors.New("runner configuration does not match cache key")
+	}
+	return frameworkrunner.NewRunner(
+		tenant.AppName(key.TenantID, key.AgentAppID),
+		buildGovernedAgent(configVersion, apiKey),
+		frameworkrunner.WithSessionService(sessions),
+		frameworkrunner.WithMemoryService(memories),
+	), nil
+}
+
 func (r *Runtime) Ready(ctx context.Context) error {
 	r.lifecycle.RLock()
 	defer r.lifecycle.RUnlock()
 	if err := r.registry.Ready(ctx); err != nil {
 		return fmt.Errorf("runtime not ready: %w", err)
 	}
+	if r.policyCache != nil {
+		if err := r.controlRepo.Ready(ctx); err != nil {
+			return fmt.Errorf("control plane not ready: %w", err)
+		}
+		if err := r.ensurePoliciesWarmed(ctx); err != nil {
+			return fmt.Errorf("policy cache not ready: %w", err)
+		}
+	}
 	return nil
+}
+
+func (r *Runtime) ensurePoliciesWarmed(ctx context.Context) error {
+	r.policyWarmMu.Lock()
+	defer r.policyWarmMu.Unlock()
+	if r.policyWarmed {
+		return nil
+	}
+	ids := make([]string, 0, len(r.repositoryCatalogTenants()))
+	for _, item := range r.repositoryCatalogTenants() {
+		if item.Enabled {
+			ids = append(ids, item.ID)
+		}
+	}
+	if err := r.policyCache.Warm(ctx, ids); err != nil {
+		return err
+	}
+	r.policyWarmed = true
+	return nil
+}
+
+func (r *Runtime) repositoryCatalogTenants() []tenant.Tenant {
+	return append([]tenant.Tenant(nil), r.catalogTenants...)
+}
+
+// AuthorizeTask is called by Worker before the Session lease is acquired.
+func (r *Runtime) AuthorizeTask(ctx context.Context, task platformmessage.ExecutionTask) error {
+	if r.policyEnforcer == nil {
+		return nil
+	}
+	return r.policyEnforcer.AuthorizeTask(ctx, task)
+}
+
+func (r *Runtime) policyForTask(ctx context.Context, task platformmessage.ExecutionTask) (governance.PolicySnapshot, error) {
+	if r.policyCache == nil {
+		return governance.PolicySnapshot{}, nil
+	}
+	snapshot, err := r.policyCache.Snapshot(ctx, task.TenantID)
+	if err != nil {
+		return governance.PolicySnapshot{}, err
+	}
+	if err := governance.AuthorizeActor(snapshot.Policy, r.identitySecret, task.ActorUserID); err != nil {
+		return governance.PolicySnapshot{}, err
+	}
+	return snapshot, nil
 }
 
 func (r *Runtime) backendForBinding(ctx context.Context, channel, bindingID string) (storage.Backend, error) {
@@ -275,9 +398,24 @@ func (r *Runtime) Execute(ctx context.Context, task platformmessage.ExecutionTas
 	if err != nil {
 		return Reply{}, fmt.Errorf("%w: active config lookup failed", ErrConfigurationUnavailable)
 	}
+	policySnapshot, err := r.policyForTask(ctx, task)
+	if err != nil {
+		return Reply{}, err
+	}
 
 	requestCtx, cancel := context.WithTimeout(ctx, configVersion.Model.RequestTimeout)
 	defer cancel()
+	requestCtx = governance.WithPolicy(requestCtx, policySnapshot)
+	requestCtx = governance.WithTaskAudit(requestCtx, r.auditSink, task, r.identitySecret)
+	if r.confirmations != nil {
+		requestCtx = governance.WithConfirmationManager(requestCtx, r.confirmations, governance.ActorHash(r.identitySecret, task.ActorUserID), task.SessionID)
+	}
+	if nonce, ok := governance.ParseConfirmationCommand(task.Text); ok && r.confirmations != nil {
+		if _, confirmErr := r.confirmations.Approve(requestCtx, task.TenantID, governance.ActorHash(r.identitySecret, task.ActorUserID), task.SessionID, nonce); confirmErr != nil {
+			return Reply{}, confirmErr
+		}
+		return Reply{Channel: task.Channel, BindingID: binding.ID, RequestID: task.RequestID, TraceID: task.TraceID, TraceParent: task.TraceParent, DigestVersion: task.DigestVersion, SessionID: task.SessionID, Text: "confirmation accepted"}, nil
+	}
 	key := agent.CacheKey{
 		TenantID: task.TenantID, AgentAppID: task.AgentAppID, ConfigVersion: task.ConfigVersion,
 	}
@@ -330,7 +468,7 @@ func (r *Runtime) Execute(ctx context.Context, task platformmessage.ExecutionTas
 	}
 	return Reply{
 		Channel: task.Channel, BindingID: binding.ID, RequestID: task.RequestID,
-		TraceID: task.TraceID, SessionID: task.SessionID, Text: text,
+		TraceID: task.TraceID, TraceParent: task.TraceParent, DigestVersion: task.DigestVersion, SessionID: task.SessionID, Text: text,
 	}, nil
 }
 
@@ -353,6 +491,10 @@ func (r *Runtime) ExecuteFenced(ctx context.Context, task platformmessage.Execut
 	configVersion, err := r.repository.GetConfigVersion(ctx, task.TenantID, task.AgentAppID, task.ConfigVersion)
 	if err != nil {
 		return Reply{}, sessionfence.TurnCommit{}, ErrConfigurationUnavailable
+	}
+	policySnapshot, policyErr := r.policyForTask(ctx, task)
+	if policyErr != nil {
+		return Reply{}, sessionfence.TurnCommit{}, policyErr
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, configVersion.Model.RequestTimeout)
 	defer cancel()
@@ -384,9 +526,33 @@ func (r *Runtime) ExecuteFenced(ctx context.Context, task platformmessage.Execut
 		fence.UserCoord = sessionfence.UserCoordFor(task.TenantID, task.ChannelBindingID, task.RunnerUserID)
 	}
 	turn := svc.StartTurn(session.Key{AppName: tenant.AppName(task.TenantID, task.AgentAppID), UserID: task.RunnerUserID, SessionID: task.SessionID}, fence)
+	if nonce, ok := governance.ParseConfirmationCommand(task.Text); ok && r.confirmations != nil {
+		actorHash := governance.ActorHash(r.identitySecret, task.ActorUserID)
+		confirmation, confirmErr := r.confirmations.Approve(ctx, task.TenantID, actorHash, task.SessionID, nonce)
+		if confirmErr != nil {
+			svc.Discard(turn)
+			return Reply{}, sessionfence.TurnCommit{}, confirmErr
+		}
+		// Approval is deliberately separate from consumption. The next matching
+		// dangerous tool call consumes the one-time record atomically.
+		_ = confirmation
+		commit, prepareErr := svc.Prepare(turn)
+		if prepareErr != nil {
+			svc.Discard(turn)
+			return Reply{}, sessionfence.TurnCommit{}, prepareErr
+		}
+		commit.TraceParent = task.TraceParent
+		commit.DigestVersion = task.DigestVersion
+		return Reply{Channel: task.Channel, BindingID: binding.ID, RequestID: task.RequestID, TraceID: task.TraceID, TraceParent: task.TraceParent, DigestVersion: task.DigestVersion, SessionID: task.SessionID, Text: "confirmation accepted"}, commit, nil
+	}
 	requestCtx, requestCancel := context.WithCancel(requestCtx)
 	defer requestCancel()
 	runCtx := sessionfence.WithTurn(requestCtx, turn)
+	runCtx = governance.WithPolicy(runCtx, policySnapshot)
+	runCtx = governance.WithTaskAudit(runCtx, r.auditSink, task, r.identitySecret)
+	if r.confirmations != nil {
+		runCtx = governance.WithConfirmationManager(runCtx, r.confirmations, governance.ActorHash(r.identitySecret, task.ActorUserID), task.SessionID)
+	}
 	events, err := lease.Runner.Run(runCtx, task.RunnerUserID, task.SessionID, model.Message{Role: model.RoleUser, Content: task.Text}, frameworkagent.WithRequestID(task.RequestID))
 	if err != nil {
 		svc.Discard(turn)
@@ -415,7 +581,9 @@ func (r *Runtime) ExecuteFenced(ctx context.Context, task platformmessage.Execut
 		svc.Discard(turn)
 		return Reply{}, sessionfence.TurnCommit{}, err
 	}
-	return Reply{Channel: task.Channel, BindingID: binding.ID, RequestID: task.RequestID, TraceID: task.TraceID, SessionID: task.SessionID, Text: text}, commit, nil
+	commit.TraceParent = task.TraceParent
+	commit.DigestVersion = task.DigestVersion
+	return Reply{Channel: task.Channel, BindingID: binding.ID, RequestID: task.RequestID, TraceID: task.TraceID, TraceParent: task.TraceParent, DigestVersion: task.DigestVersion, SessionID: task.SessionID, Text: text}, commit, nil
 }
 
 func svcTurnTooLarge(turn *sessionfence.Turn) bool {
@@ -461,6 +629,12 @@ func (r *Runtime) Close() error {
 		// Runners borrow Session/Memory services from the provider. Close all
 		// runners before closing the provider-owned services.
 		r.closeErr = errors.Join(r.registry.Close(), r.backends.Close())
+		if r.auditSink != nil {
+			r.closeErr = errors.Join(r.closeErr, r.auditSink.Close())
+		}
+		if r.controlRepo != nil {
+			r.closeErr = errors.Join(r.closeErr, r.controlRepo.Close())
+		}
 	})
 	return r.closeErr
 }
@@ -484,5 +658,36 @@ func buildAgent(configVersion tenant.ConfigVersion, apiKey string) frameworkagen
 		llmagent.WithGenerationConfig(model.GenerationConfig{
 			MaxTokens: &maxTokens, Temperature: &temperature, Stream: false,
 		}),
+	)
+}
+
+func buildGovernedAgent(configVersion tenant.ConfigVersion, apiKey string) frameworkagent.Agent {
+	maxTokens := configVersion.Model.MaxOutputTokens
+	temperature := 0.2
+	registry := platformtool.NewRegistry()
+	allowed := make(map[string]struct{})
+	for _, name := range registry.Names() {
+		allowed[name] = struct{}{}
+	}
+	callbacks := frameworktool.NewCallbacks()
+	callbacks.RegisterBeforeTool(func(ctx context.Context, args *frameworktool.BeforeToolArgs) (*frameworktool.BeforeToolResult, error) {
+		nonce, err := governance.AuthorizeToolCall(ctx, args.ToolName, args.Arguments)
+		if err != nil {
+			return nil, err
+		}
+		if nonce != "" {
+			return &frameworktool.BeforeToolResult{CustomResult: fmt.Sprintf("confirmation required: confirm %s", nonce)}, nil
+		}
+		return nil, nil
+	})
+	return llmagent.New(
+		configVersion.AgentAppID,
+		llmagent.WithModel(newOpenAIModel(configVersion, apiKey)),
+		llmagent.WithInstruction(configVersion.Instruction),
+		llmagent.WithGenerationConfig(model.GenerationConfig{
+			MaxTokens: &maxTokens, Temperature: &temperature, Stream: false,
+		}),
+		llmagent.WithTools(registry.Tools(allowed)),
+		llmagent.WithToolCallbacks(callbacks),
 	)
 }
