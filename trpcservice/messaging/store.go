@@ -19,6 +19,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/control"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/keyspace"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
@@ -63,24 +64,32 @@ var (
 )
 
 type Snapshot struct {
-	InboxKey       string
-	TaskID         string
-	Digest         string
-	State          string
-	Attempt        int
-	TraceID        string
-	RequestID      string
-	ErrorCode      string
-	Result         *message.TaskResult
-	RawPayload     string
-	SessionCoord   string
-	SessionSeq     int64
-	Owner          string
-	LeaseEpoch     int64
-	LeaseUntil     int64
-	RawEnvelope    string
-	EnvelopeDigest string
-	PersistAttempt int
+	InboxKey                string
+	TaskID                  string
+	Digest                  string
+	State                   string
+	Attempt                 int
+	TraceID                 string
+	TraceParent             string
+	DigestVersion           int
+	RequestID               string
+	ErrorCode               string
+	Result                  *message.TaskResult
+	RawPayload              string
+	SessionCoord            string
+	SessionSeq              int64
+	Owner                   string
+	LeaseEpoch              int64
+	LeaseUntil              int64
+	RawEnvelope             string
+	EnvelopeDigest          string
+	PersistAttempt          int
+	NodeID                  string
+	AssignmentRevision      int64
+	AssignmentState         string
+	AssignmentMode          string
+	AssignmentBlockedReason string
+	AssignmentPayloadDigest string
 }
 
 func (s Snapshot) Terminal() bool {
@@ -121,6 +130,7 @@ type Store struct {
 	persistenceRetryKey string
 	inboxPrefix         string
 	sessionWaitKey      string
+	nodeWaitKey         string
 
 	mu        sync.RWMutex
 	closed    bool
@@ -182,6 +192,7 @@ func NewStore(cfg config.MessagingConfig) (*Store, error) {
 		retryKey: base + ":agent.retry", inboxPrefix: base + ":inbox:",
 		persistenceRetryKey: keyspace.PersistenceRetry(cfg.KeyPrefix),
 		sessionWaitKey:      keyspace.SessionWait(cfg.KeyPrefix),
+		nodeWaitKey:         base + ":node:wait",
 		fingerprints:        make(map[string]string),
 	}, nil
 }
@@ -254,6 +265,22 @@ func createGroup(ctx context.Context, client *redis.Client, stream, group string
 }
 
 func (s *Store) Submit(ctx context.Context, task message.ExecutionTask) (Snapshot, bool, error) {
+	return s.submit(ctx, task, nil)
+}
+
+// SubmitAssigned atomically persists the task and its Messaging-side node
+// projection. The control-plane assignment remains the management record.
+func (s *Store) SubmitAssigned(ctx context.Context, task message.ExecutionTask, assignment control.NodeAssignment) (Snapshot, bool, error) {
+	if err := assignment.Validate(); err != nil {
+		return Snapshot{}, false, err
+	}
+	if assignment.InboxID != task.InboxID() || assignment.TenantID != task.TenantID || assignment.AgentAppID != task.AgentAppID || assignment.PayloadDigest != task.PayloadDigest {
+		return Snapshot{}, false, control.ErrAssignmentConflict
+	}
+	return s.submit(ctx, task, &assignment)
+}
+
+func (s *Store) submit(ctx context.Context, task message.ExecutionTask, assignment *control.NodeAssignment) (Snapshot, bool, error) {
 	if err := task.Validate(); err != nil {
 		return Snapshot{}, false, err
 	}
@@ -269,9 +296,12 @@ func (s *Store) Submit(ctx context.Context, task message.ExecutionTask) (Snapsho
 	created := false
 	if s.config.SessionFencing == "strong" {
 		coord := sessionCoord(task)
+		args := []interface{}{task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID, coord, strconv.FormatInt(time.Now().UnixMilli(), 10)}
+		if assignment != nil {
+			args = append(args, assignment.NodeID, assignment.Revision, string(assignment.Mode), string(assignment.State), assignment.PayloadDigest)
+		}
 		result, runErr := submitWithSessionScript.Run(ctx, s.client, []string{inboxKey, s.taskStream, s.sessionSeqKey(coord), s.sessionStateKey(coord)},
-			task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID, coord,
-			strconv.FormatInt(time.Now().UnixMilli(), 10)).Slice()
+			args...).Slice()
 		if runErr != nil {
 			return Snapshot{}, false, fmt.Errorf("submit reliable task: %w", runErr)
 		}
@@ -283,8 +313,12 @@ func (s *Store) Submit(ctx context.Context, task message.ExecutionTask) (Snapsho
 		}
 		created = len(result) > 0 && asInt64(result[0]) == 1
 	} else {
+		args := []interface{}{task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID}
+		if assignment != nil {
+			args = append(args, assignment.NodeID, assignment.Revision, string(assignment.Mode), string(assignment.State), assignment.PayloadDigest)
+		}
 		result, runErr := legacySubmitScript.Run(ctx, s.client, []string{inboxKey, s.taskStream},
-			task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID).Int()
+			args...).Int()
 		if runErr != nil {
 			return Snapshot{}, false, fmt.Errorf("submit reliable task: %w", runErr)
 		}
@@ -319,7 +353,10 @@ func (s *Store) snapshotByKey(ctx context.Context, inboxKey string) (Snapshot, e
 		InboxKey: inboxKey, TaskID: values["task_id"], Digest: values["digest"],
 		State: values["state"], TraceID: values["trace_id"], ErrorCode: values["error_code"], RequestID: values["request_id"],
 		RawPayload: values["payload"], SessionCoord: values["session_coord"], Owner: values["owner"],
+		NodeID: values["node_id"], AssignmentState: values["assignment_state"], AssignmentMode: values["assignment_mode"],
+		AssignmentBlockedReason: values["blocked_reason"], AssignmentPayloadDigest: values["assignment_payload_digest"],
 	}
+	snapshot.AssignmentRevision, _ = strconv.ParseInt(values["assignment_revision"], 10, 64)
 	snapshot.Attempt, _ = strconv.Atoi(values["attempt"])
 	snapshot.SessionSeq, _ = strconv.ParseInt(values["session_seq"], 10, 64)
 	snapshot.LeaseEpoch, _ = strconv.ParseInt(values["lease_epoch"], 10, 64)
@@ -331,6 +368,8 @@ func (s *Store) snapshotByKey(ctx context.Context, inboxKey string) (Snapshot, e
 		var storedTask message.ExecutionTask
 		if decodeStrictJSON(snapshot.RawPayload, &storedTask) == nil {
 			snapshot.RequestID = storedTask.RequestID
+			snapshot.TraceParent = storedTask.TraceParent
+			snapshot.DigestVersion = storedTask.DigestVersion
 		}
 	}
 	if raw := values["result"]; raw != "" {
@@ -650,7 +689,8 @@ func (s *Store) Complete(ctx context.Context, lease Lease, reply message.Outboun
 	result := message.TaskResult{
 		SchemaVersion: message.TaskSchemaVersion, TaskID: lease.Delivery.Task.TaskID, Succeeded: true,
 		Channel: target.Channel, BindingID: target.ChannelBindingID, Reply: reply,
-		TraceID: lease.Delivery.Task.TraceID,
+		TraceID:     lease.Delivery.Task.TraceID,
+		TraceParent: lease.Delivery.Task.TraceParent, DigestVersion: lease.Delivery.Task.DigestVersion,
 	}
 	if target.Valid() {
 		result.Target = target
@@ -660,7 +700,7 @@ func (s *Store) Complete(ctx context.Context, lease Lease, reply message.Outboun
 
 func (s *Store) Fail(ctx context.Context, lease Lease, errorCode string) error {
 	target := lease.Delivery.Task.DeliveryTarget()
-	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: lease.Delivery.Task.TaskID, Channel: target.Channel, BindingID: target.ChannelBindingID, ErrorCode: errorCode, TraceID: lease.Delivery.Task.TraceID}
+	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: lease.Delivery.Task.TaskID, Channel: target.Channel, BindingID: target.ChannelBindingID, ErrorCode: errorCode, TraceID: lease.Delivery.Task.TraceID, TraceParent: lease.Delivery.Task.TraceParent, DigestVersion: lease.Delivery.Task.DigestVersion}
 	if target.Valid() {
 		result.Target = target
 	}
@@ -668,6 +708,12 @@ func (s *Store) Fail(ctx context.Context, lease Lease, errorCode string) error {
 }
 
 func (s *Store) finish(ctx context.Context, lease Lease, result message.TaskResult, errorCode string) error {
+	if result.TraceParent == "" {
+		result.TraceParent = lease.Delivery.Task.TraceParent
+	}
+	if result.DigestVersion == 0 {
+		result.DigestVersion = lease.Delivery.Task.DigestVersion
+	}
 	payload, err := json.Marshal(result)
 	if err != nil {
 		return err
@@ -732,7 +778,7 @@ func (s *Store) Reject(ctx context.Context, delivery Delivery, errorCode string)
 		_, _ = ackReplyScript.Run(ctx, s.client, []string{s.taskStream}, workerGroup, delivery.StreamID).Result()
 		return nil
 	}
-	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: snapshot.TaskID, ErrorCode: errorCode, TraceID: snapshot.TraceID}
+	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: snapshot.TaskID, ErrorCode: errorCode, TraceID: snapshot.TraceID, TraceParent: snapshot.TraceParent, DigestVersion: snapshot.DigestVersion}
 	payload, _ := json.Marshal(result)
 	if s.config.SessionFencing == "strong" && snapshot.SessionCoord != "" && snapshot.SessionSeq > 0 {
 		now, nowErr := s.redisTime(ctx)
@@ -840,7 +886,7 @@ func (s *Store) Recover(ctx context.Context, delivery Delivery, currentConsumer 
 		return err
 	}
 	target := delivery.Task.DeliveryTarget()
-	failed := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: delivery.Task.TaskID, Channel: target.Channel, BindingID: target.ChannelBindingID, ErrorCode: "worker_lost", TraceID: delivery.Task.TraceID}
+	failed := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: delivery.Task.TaskID, Channel: target.Channel, BindingID: target.ChannelBindingID, ErrorCode: "worker_lost", TraceID: delivery.Task.TraceID, TraceParent: delivery.Task.TraceParent, DigestVersion: delivery.Task.DigestVersion}
 	if target.Valid() {
 		failed.Target = target
 	}

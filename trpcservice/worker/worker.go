@@ -11,10 +11,13 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/control"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
 )
 
@@ -32,10 +35,15 @@ type PersistenceExecutor interface {
 	Persist(context.Context, persistence.Envelope) error
 }
 
+type TaskAuthorizer interface {
+	AuthorizeTask(context.Context, message.ExecutionTask) error
+}
+
 type Worker struct {
-	store    *messaging.Store
-	executor Executor
-	consumer string
+	store      *messaging.Store
+	executor   Executor
+	consumer   string
+	controller *scheduler.Controller
 
 	running     atomic.Bool
 	mu          sync.Mutex
@@ -45,6 +53,10 @@ type Worker struct {
 }
 
 func New(store *messaging.Store, runtime Executor, consumer string) (*Worker, error) {
+	return NewWithController(store, runtime, consumer, nil)
+}
+
+func NewWithController(store *messaging.Store, runtime Executor, consumer string, controller *scheduler.Controller) (*Worker, error) {
 	if store == nil || runtime == nil {
 		return nil, errors.New("messaging store and executor are required")
 	}
@@ -56,7 +68,7 @@ func New(store *messaging.Store, runtime Executor, consumer string) (*Worker, er
 			return nil, errors.New("strong session fencing requires a fenced executor")
 		}
 	}
-	return &Worker{store: store, executor: runtime, consumer: consumer}, nil
+	return &Worker{store: store, executor: runtime, consumer: consumer, controller: controller}, nil
 }
 
 func (w *Worker) Run(ctx context.Context) error {
@@ -83,7 +95,17 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err := w.store.Ready(runCtx); err != nil {
 		return err
 	}
+	if w.controller != nil {
+		if err := w.controller.Start(runCtx); err != nil {
+			return err
+		}
+	}
 	w.running.Store(true)
+	defer func() {
+		if w.controller != nil {
+			_ = w.controller.Close()
+		}
+	}()
 	for {
 		if runCtx.Err() != nil {
 			return nil
@@ -91,6 +113,15 @@ func (w *Worker) Run(ctx context.Context) error {
 		_, _ = w.store.PromoteRetries(runCtx, 32)
 		_, _ = w.store.PromotePersistenceRetries(runCtx, 32)
 		_, _ = w.store.PromoteSessionWait(runCtx, 32)
+		if w.controller != nil {
+			_, _ = w.controller.Promote(runCtx, 32)
+			if err := w.controller.Ready(runCtx); err != nil {
+				if !waitContext(runCtx, 250*time.Millisecond) {
+					return nil
+				}
+				continue
+			}
+		}
 		stale, err := w.store.ClaimStale(runCtx, w.consumer, 16)
 		if err == nil {
 			for _, delivery := range stale {
@@ -142,9 +173,34 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 		_ = w.store.Reject(context.Background(), delivery, "invalid_task")
 		return
 	}
+	if w.controller != nil && w.controller.Enabled() {
+		defer func() {
+			current, currentErr := w.store.Snapshot(context.Background(), delivery.InboxID)
+			if currentErr == nil && current.Terminal() {
+				w.controller.MarkCompleted(context.Background(), delivery)
+			}
+		}()
+	}
 	if snapshot.State == messaging.StatePersisting {
 		w.processPersistenceDelivery(runCtx, delivery)
 		return
+	}
+	if authorizer, ok := w.executor.(TaskAuthorizer); ok {
+		if authErr := authorizer.AuthorizeTask(runCtx, delivery.Task); authErr != nil {
+			_ = w.store.Reject(context.Background(), delivery, governanceErrorCode(authErr))
+			return
+		}
+	}
+	if w.controller != nil && w.controller.Enabled() {
+		admitted, admitErr := w.controller.Admit(runCtx, delivery)
+		if admitErr != nil {
+			return
+		}
+		if !admitted {
+			return
+		}
+		w.controller.SetInflight(1)
+		defer w.controller.SetInflight(0)
 	}
 	lease, err := w.store.Begin(runCtx, delivery, w.consumer)
 	if err != nil {
@@ -164,6 +220,9 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 	w.mu.Lock()
 	w.activeLease = &lease
 	w.mu.Unlock()
+	if w.controller != nil && w.controller.Enabled() {
+		w.controller.MarkRunning(runCtx, delivery)
+	}
 	execCtx, cancel := context.WithCancel(runCtx)
 	heartbeats := 1
 	if w.store.Config().SessionFencing == "strong" {
@@ -394,6 +453,14 @@ func (w *Worker) releaseAfterAgentCancellation(lease messaging.Lease) {
 
 func classify(err error) (string, bool) {
 	switch {
+	case errors.Is(err, governance.ErrActorForbidden):
+		return "actor_forbidden", false
+	case errors.Is(err, governance.ErrPolicyMissing):
+		return "tenant_policy_missing", false
+	case errors.Is(err, governance.ErrPolicyUnavailable):
+		return "tenant_policy_unavailable", false
+	case errors.Is(err, control.ErrConfirmationNotFound), errors.Is(err, control.ErrConfirmationMismatch), errors.Is(err, governance.ErrInvalidConfirmationCmd):
+		return "confirmation_denied", false
 	case errors.Is(err, persistence.ErrFingerprintConflict):
 		return "backend_fingerprint_conflict", false
 	case errors.Is(err, persistence.ErrPostgresSummaryDisabled):
@@ -417,6 +484,14 @@ func classify(err error) (string, bool) {
 	}
 }
 
+func governanceErrorCode(err error) string {
+	code, _ := classify(err)
+	if code == "agent_failed" {
+		return "tenant_policy_unavailable"
+	}
+	return code
+}
+
 func (w *Worker) Ready(ctx context.Context) error {
 	if !w.running.Load() {
 		return errors.New("worker loop is not running")
@@ -424,7 +499,15 @@ func (w *Worker) Ready(ctx context.Context) error {
 	if err := w.store.Ready(ctx); err != nil {
 		return err
 	}
-	return w.executor.Ready(ctx)
+	if err := w.executor.Ready(ctx); err != nil {
+		return err
+	}
+	if w.controller != nil {
+		if err := w.controller.Ready(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *Worker) Close() error {
@@ -435,6 +518,9 @@ func (w *Worker) Close() error {
 	timeout := w.store.Config().ShutdownTimeout
 	w.mu.Unlock()
 	if cancel != nil {
+		if w.controller != nil {
+			_ = w.controller.MarkDraining(context.Background())
+		}
 		cancel()
 	}
 	if activeDone != nil {

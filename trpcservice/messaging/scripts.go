@@ -32,6 +32,9 @@ redis.call('HSET', KEYS[1],
 local stream_id = redis.call('XADD', KEYS[2], '*', 'payload', ARGV[3], 'inbox_id', ARGV[6],
   'session_coord', ARGV[7], 'session_seq', seq)
 redis.call('HSET', KEYS[1], 'stream_id', stream_id)
+if ARGV[9] and ARGV[9] ~= '' then
+  redis.call('HSET', KEYS[1], 'node_id', ARGV[9], 'assignment_revision', ARGV[10], 'assignment_mode', ARGV[11], 'assignment_state', ARGV[12], 'assignment_payload_digest', ARGV[13])
+end
 return {1, seq, stream_id}
 `)
 
@@ -54,6 +57,9 @@ if not payload_ok or type(payload) ~= 'table' or payload['task_id'] ~= ARGV[1] o
 redis.call('HSET', KEYS[1],
   'task_id', ARGV[1], 'digest', ARGV[2], 'payload', ARGV[3],
   'state', 'queued', 'attempt', ARGV[4], 'trace_id', ARGV[5], 'inbox_id', ARGV[6])
+if ARGV[7] and ARGV[7] ~= '' then
+  redis.call('HSET', KEYS[1], 'node_id', ARGV[7], 'assignment_revision', ARGV[8], 'assignment_mode', ARGV[9], 'assignment_state', ARGV[10], 'assignment_payload_digest', ARGV[11])
+end
 local stream_id = redis.call('XADD', KEYS[2], '*', 'payload', ARGV[3], 'inbox_id', ARGV[6])
 redis.call('HSET', KEYS[1], 'stream_id', stream_id)
 return 1

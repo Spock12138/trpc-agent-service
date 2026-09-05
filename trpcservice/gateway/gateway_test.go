@@ -13,6 +13,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/routing"
@@ -27,6 +28,12 @@ type recordingAdapter struct {
 	started  bool
 	attempts int
 	messages []message.OutboundMessage
+}
+
+type rejectingAuthorizer struct{ err error }
+
+func (a rejectingAuthorizer) AuthorizeTask(context.Context, message.ExecutionTask) error {
+	return a.err
 }
 
 func (a *recordingAdapter) Name() string { return a.name }
@@ -126,6 +133,24 @@ func TestGatewayTimeoutLeavesTaskPending(t *testing.T) {
 	snapshot, err := store.Snapshot(context.Background(), snapshotTask.InboxID())
 	if err != nil || snapshot.State != messaging.StateQueued {
 		t.Fatalf("pending snapshot = (%#v, %v)", snapshot, err)
+	}
+}
+
+func TestGatewayPolicyRejectionDoesNotSubmit(t *testing.T) {
+	service, store, cancel, done := newGatewayService(t, time.Second)
+	defer func() { cancel(); _ = <-done }()
+	service.SetTaskAuthorizer(rejectingAuthorizer{err: governance.ErrActorForbidden})
+	inbound := gatewayInbound("message-denied", "hello", "request-denied")
+	reply, err := service.Handle(context.Background(), inbound)
+	if !errors.Is(err, governance.ErrActorForbidden) || reply.TraceID != inbound.TraceID {
+		t.Fatalf("Handle() = (%#v, %v)", reply, err)
+	}
+	task, resolveErr := service.router.Resolve(context.Background(), inbound)
+	if resolveErr != nil {
+		t.Fatal(resolveErr)
+	}
+	if _, snapshotErr := store.Snapshot(context.Background(), task.InboxID()); !errors.Is(snapshotErr, messaging.ErrInboxMissing) {
+		t.Fatalf("denied task was submitted: %v", snapshotErr)
 	}
 }
 

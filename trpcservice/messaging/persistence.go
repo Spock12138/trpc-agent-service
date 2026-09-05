@@ -207,7 +207,7 @@ func (s *Store) FinalizePersistence(ctx context.Context, lease Lease, envelope p
 	}
 	target := lease.Delivery.Task.DeliveryTarget()
 	reply := target.Apply(envelope.Reply)
-	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: envelope.TaskID, Succeeded: true, Channel: target.Channel, BindingID: target.ChannelBindingID, Reply: reply, TraceID: lease.Delivery.Task.TraceID}
+	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: envelope.TaskID, Succeeded: true, Channel: target.Channel, BindingID: target.ChannelBindingID, Reply: reply, TraceID: lease.Delivery.Task.TraceID, TraceParent: lease.Delivery.Task.TraceParent, DigestVersion: lease.Delivery.Task.DigestVersion}
 	if target.Valid() {
 		result.Target = target
 	}
@@ -300,7 +300,7 @@ func (s *Store) FailPersistence(ctx context.Context, lease Lease, envelope persi
 		return persistence.ErrInvalidEnvelope
 	}
 	target := lease.Delivery.Task.DeliveryTarget()
-	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: envelope.TaskID, Channel: target.Channel, BindingID: target.ChannelBindingID, ErrorCode: errorCode, TraceID: lease.Delivery.Task.TraceID}
+	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: envelope.TaskID, Channel: target.Channel, BindingID: target.ChannelBindingID, ErrorCode: errorCode, TraceID: lease.Delivery.Task.TraceID, TraceParent: lease.Delivery.Task.TraceParent, DigestVersion: lease.Delivery.Task.DigestVersion}
 	if target.Valid() {
 		result.Target = target
 	}
@@ -332,7 +332,7 @@ func (s *Store) FailCorruptPersistence(ctx context.Context, lease Lease, errorCo
 		return persistence.ErrInvalidEnvelope
 	}
 	target := lease.Delivery.Task.DeliveryTarget()
-	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: lease.Delivery.Task.TaskID, Channel: target.Channel, BindingID: target.ChannelBindingID, ErrorCode: errorCode, TraceID: lease.Delivery.Task.TraceID}
+	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: lease.Delivery.Task.TaskID, Channel: target.Channel, BindingID: target.ChannelBindingID, ErrorCode: errorCode, TraceID: lease.Delivery.Task.TraceID, TraceParent: lease.Delivery.Task.TraceParent, DigestVersion: lease.Delivery.Task.DigestVersion}
 	if target.Valid() {
 		result.Target = target
 	}

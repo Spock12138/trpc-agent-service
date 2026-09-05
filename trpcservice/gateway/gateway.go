@@ -15,9 +15,11 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/routing"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
 )
 
 var (
@@ -27,9 +29,11 @@ var (
 )
 
 type Service struct {
-	router   *routing.Router
-	store    *messaging.Store
-	consumer string
+	router     *routing.Router
+	store      *messaging.Store
+	consumer   string
+	scheduler  *scheduler.Service
+	authorizer governance.TaskAuthorizer
 
 	running  atomic.Bool
 	mu       sync.Mutex
@@ -56,7 +60,10 @@ func (s *Service) Accept(ctx context.Context, inbound message.InboundMessage) (c
 			return channels.AcceptResult{}, err
 		}
 	}
-	snapshot, created, err := s.store.Submit(ctx, task)
+	if err := s.authorize(ctx, task); err != nil {
+		return channels.AcceptResult{RequestID: task.RequestID, TraceID: task.TraceID}, err
+	}
+	snapshot, created, err := s.submit(ctx, task)
 	if err != nil {
 		if errors.Is(err, messaging.ErrConflict) {
 			return channels.AcceptResult{RequestID: task.RequestID, TraceID: task.TraceID}, ErrMessageConflict
@@ -85,6 +92,10 @@ func New(router *routing.Router, store *messaging.Store, consumer string) (*Serv
 }
 
 func NewWithAdapters(router *routing.Router, store *messaging.Store, consumer string, adapters ...channels.Adapter) (*Service, error) {
+	return NewWithScheduler(router, store, consumer, nil, adapters...)
+}
+
+func NewWithScheduler(router *routing.Router, store *messaging.Store, consumer string, assignmentScheduler *scheduler.Service, adapters ...channels.Adapter) (*Service, error) {
 	if router == nil || store == nil {
 		return nil, errors.New("router and messaging store are required")
 	}
@@ -92,7 +103,7 @@ func NewWithAdapters(router *routing.Router, store *messaging.Store, consumer st
 		return nil, errors.New("gateway consumer name is required")
 	}
 	service := &Service{
-		router: router, store: store, consumer: consumer, waiters: make(map[string][]chan struct{}),
+		router: router, store: store, consumer: consumer, scheduler: assignmentScheduler, waiters: make(map[string][]chan struct{}),
 		adapters: make(map[string]channels.Adapter, len(adapters)), queues: make(map[string]chan messaging.ReplyDelivery, len(adapters)),
 	}
 	for _, adapter := range adapters {
@@ -106,6 +117,16 @@ func NewWithAdapters(router *routing.Router, store *messaging.Store, consumer st
 		service.queues[adapter.Name()] = make(chan messaging.ReplyDelivery, 64)
 	}
 	return service, nil
+}
+
+func (s *Service) TraceDigestV2Enabled() bool {
+	return s != nil && s.router.TraceDigestV2Enabled()
+}
+
+func (s *Service) SetTaskAuthorizer(authorizer governance.TaskAuthorizer) {
+	if s != nil {
+		s.authorizer = authorizer
+	}
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -130,6 +151,12 @@ func (s *Service) Run(ctx context.Context) error {
 	}()
 	if err := s.store.Ready(runCtx); err != nil {
 		return err
+	}
+	if s.scheduler != nil {
+		if err := s.scheduler.Start(runCtx); err != nil {
+			return err
+		}
+		defer s.scheduler.Close()
 	}
 	adapterErrors := make(chan error, len(s.adapters))
 	for name, adapter := range s.adapters {
@@ -288,7 +315,10 @@ func (s *Service) Handle(ctx context.Context, inbound message.InboundMessage) (m
 			return message.OutboundMessage{}, err
 		}
 	}
-	snapshot, _, err := s.store.Submit(ctx, task)
+	if err := s.authorize(ctx, task); err != nil {
+		return message.OutboundMessage{TraceID: task.TraceID}, err
+	}
+	snapshot, _, err := s.submit(ctx, task)
 	if err != nil {
 		if errors.Is(err, messaging.ErrConflict) {
 			if existing, snapshotErr := s.store.Snapshot(ctx, task.InboxID()); snapshotErr == nil {
@@ -326,6 +356,20 @@ func (s *Service) Handle(ctx context.Context, inbound message.InboundMessage) (m
 			return resultForRequest(current, inbound.RequestID)
 		}
 	}
+}
+
+func (s *Service) authorize(ctx context.Context, task message.ExecutionTask) error {
+	if s.authorizer == nil {
+		return nil
+	}
+	return s.authorizer.AuthorizeTask(ctx, task)
+}
+
+func (s *Service) submit(ctx context.Context, task message.ExecutionTask) (messaging.Snapshot, bool, error) {
+	if s.scheduler != nil {
+		return s.scheduler.Submit(ctx, task)
+	}
+	return s.store.Submit(ctx, task)
 }
 
 func resultForRequest(snapshot messaging.Snapshot, requestID string) (message.OutboundMessage, error) {
@@ -379,6 +423,11 @@ func (s *Service) Ready(ctx context.Context) error {
 	}
 	for _, adapter := range s.adapters {
 		if err := adapter.Ready(ctx); err != nil {
+			return err
+		}
+	}
+	if s.scheduler != nil {
+		if err := s.scheduler.Ready(ctx); err != nil {
 			return err
 		}
 	}

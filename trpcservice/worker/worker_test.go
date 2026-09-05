@@ -12,6 +12,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
 )
@@ -22,6 +23,13 @@ type fakeExecutor struct {
 	failFor  int
 	block    time.Duration
 }
+
+type denyingExecutor struct {
+	fakeExecutor
+	err error
+}
+
+func (e *denyingExecutor) AuthorizeTask(context.Context, message.ExecutionTask) error { return e.err }
 
 func (f *fakeExecutor) Ready(context.Context) error { return nil }
 
@@ -71,6 +79,31 @@ func TestWorkerRetriesThenCompletes(t *testing.T) {
 	}
 	snapshot := waitTerminal(t, store, task.InboxID(), 4*time.Second)
 	if snapshot.State != messaging.StateSucceeded || exec.count() != 2 {
+		t.Fatalf("snapshot=%#v attempts=%d", snapshot, exec.count())
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkerPolicyDenialDoesNotExecuteOrAcquireSession(t *testing.T) {
+	store := newWorkerStore(t, 20*time.Millisecond, 200*time.Millisecond)
+	exec := &denyingExecutor{err: governance.ErrActorForbidden}
+	service, err := New(store, exec, "worker-governance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.Run(ctx) }()
+	waitReady(t, service)
+	task := workerTask("actor-forbidden")
+	if _, _, err := store.Submit(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := waitTerminal(t, store, task.InboxID(), 3*time.Second)
+	if snapshot.ErrorCode != "actor_forbidden" || exec.count() != 0 {
 		t.Fatalf("snapshot=%#v attempts=%d", snapshot, exec.count())
 	}
 	cancel()

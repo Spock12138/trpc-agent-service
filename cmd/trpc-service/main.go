@@ -18,14 +18,19 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/control"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/httpapi"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/routing"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 )
 
@@ -78,6 +83,13 @@ func serve(args []string) error {
 		return err
 	}
 	defer store.Close()
+	controlRepository, err := newControlRepository(cfg)
+	if err != nil {
+		return err
+	}
+	if controlRepository != nil {
+		defer controlRepository.Close()
+	}
 	router, err := newRouter(cfg)
 	if err != nil {
 		return err
@@ -100,6 +112,33 @@ func serve(args []string) error {
 		return err
 	}
 	workerService, err := worker.New(store, runtime, workerConsumer)
+	if controlRepository != nil {
+		assignmentScheduler, schedulerErr := scheduler.New(controlRepository, store, cfg.ControlPlane.NodeAssignmentEnabled)
+		if schedulerErr != nil {
+			return schedulerErr
+		}
+		assignmentController, controllerErr := scheduler.NewController(controlRepository, store, cfg.ControlPlane, strings.TrimSpace(os.Getenv("NODE_ID")), trpcservice.Version)
+		if controllerErr != nil {
+			return controllerErr
+		}
+		if cfg.ControlPlane.NodeAssignmentEnabled {
+			workerConsumer = assignmentController.ConsumerName()
+		}
+		workerService, controllerErr = worker.NewWithController(store, runtime, workerConsumer, assignmentController)
+		if controllerErr != nil {
+			return controllerErr
+		}
+		gatewayService, gatewayErr := gateway.NewWithScheduler(router, store, gatewayConsumer, assignmentScheduler, adapters...)
+		if gatewayErr != nil {
+			return gatewayErr
+		}
+		gatewayAudit, gatewayErr := configureGatewayGovernance(cfg, controlRepository, gatewayService)
+		if gatewayErr != nil {
+			return gatewayErr
+		}
+		defer gatewayAudit.Close()
+		return runCombined(addr, gatewayService, workerService, runtime, adminHTTPConfig(cfg, controlRepository, assignmentScheduler))
+	}
 	if err != nil {
 		return err
 	}
@@ -107,7 +146,7 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	return runCombined(addr, gatewayService, workerService, runtime)
+	return runCombined(addr, gatewayService, workerService, runtime, httpapi.AdminConfig{})
 }
 
 func runGateway(args []string) error {
@@ -130,6 +169,13 @@ func runGateway(args []string) error {
 		return err
 	}
 	defer store.Close()
+	controlRepository, err := newControlRepository(cfg)
+	if err != nil {
+		return err
+	}
+	if controlRepository != nil {
+		defer controlRepository.Close()
+	}
 	router, err := newRouter(cfg)
 	if err != nil {
 		return err
@@ -138,11 +184,41 @@ func runGateway(args []string) error {
 	if err != nil {
 		return err
 	}
-	service, err := gateway.NewWithAdapters(router, store, consumer, adapters...)
+	var service *gateway.Service
+	var assignmentScheduler *scheduler.Service
+	if controlRepository != nil {
+		var schedulerErr error
+		assignmentScheduler, schedulerErr = scheduler.New(controlRepository, store, cfg.ControlPlane.NodeAssignmentEnabled)
+		if schedulerErr != nil {
+			return schedulerErr
+		}
+		service, err = gateway.NewWithScheduler(router, store, consumer, assignmentScheduler, adapters...)
+	} else {
+		service, err = gateway.NewWithAdapters(router, store, consumer, adapters...)
+	}
 	if err != nil {
 		return err
 	}
-	return runGatewayServer(addr, service)
+	if controlRepository != nil {
+		gatewayAudit, governanceErr := configureGatewayGovernance(cfg, controlRepository, service)
+		if governanceErr != nil {
+			return governanceErr
+		}
+		defer gatewayAudit.Close()
+	}
+	return runGatewayServer(addr, service, adminHTTPConfig(cfg, controlRepository, assignmentScheduler))
+}
+
+func configureGatewayGovernance(cfg config.Config, repository control.Repository, service *gateway.Service) (*metrics.AsyncAuditSink, error) {
+	cache, err := governance.NewPolicyCache(repository, cfg.ControlPlane.PolicyCacheTTL)
+	if err != nil {
+		return nil, err
+	}
+	sink := metrics.NewAuditSink(repository, 256)
+	enforcer := governance.NewPolicyEnforcer(cache, cfg.IdentitySecret, repository)
+	enforcer.SetAuditSink(sink)
+	service.SetTaskAuthorizer(enforcer)
+	return sink, nil
 }
 
 func runWorker(args []string) error {
@@ -165,12 +241,31 @@ func runWorker(args []string) error {
 		return err
 	}
 	defer store.Close()
+	controlRepository, err := newControlRepository(cfg)
+	if err != nil {
+		return err
+	}
+	if controlRepository != nil {
+		defer controlRepository.Close()
+	}
 	runtime, err := executor.New(cfg)
 	if err != nil {
 		return err
 	}
 	defer runtime.Close()
-	service, err := worker.New(store, runtime, consumer)
+	var service *worker.Worker
+	if controlRepository != nil {
+		assignmentController, controllerErr := scheduler.NewController(controlRepository, store, cfg.ControlPlane, strings.TrimSpace(os.Getenv("NODE_ID")), trpcservice.Version)
+		if controllerErr != nil {
+			return controllerErr
+		}
+		if cfg.ControlPlane.NodeAssignmentEnabled {
+			consumer = assignmentController.ConsumerName()
+		}
+		service, err = worker.NewWithController(store, runtime, consumer, assignmentController)
+	} else {
+		service, err = worker.New(store, runtime, consumer)
+	}
 	if err != nil {
 		return err
 	}
@@ -186,7 +281,28 @@ func newRouter(cfg config.Config) (*routing.Router, error) {
 	if err != nil {
 		return nil, err
 	}
-	return routing.New(repository, cfg.IdentitySecret)
+	return routing.NewWithDigestV2(repository, cfg.IdentitySecret, cfg.ControlPlane != nil && cfg.ControlPlane.TraceDigestV2Enabled)
+}
+
+func newControlRepository(cfg config.Config) (control.Repository, error) {
+	if cfg.ControlPlane == nil {
+		return nil, nil
+	}
+	repository, err := control.NewRedisRepository(*cfg.ControlPlane)
+	if err != nil {
+		return nil, err
+	}
+	defaultTools := platformtool.NewRegistry().NonDangerousNames()
+	return control.NewInitializingRepository(repository, cfg.Catalog.Tenants, defaultTools), nil
+}
+
+func adminHTTPConfig(cfg config.Config, repository control.Repository, overrider interface {
+	Override(context.Context, string, string) (control.NodeAssignment, error)
+}) httpapi.AdminConfig {
+	if cfg.ControlPlane == nil || repository == nil {
+		return httpapi.AdminConfig{}
+	}
+	return httpapi.AdminConfig{Repository: repository, Token: cfg.ControlPlane.AdminToken, AssignmentOverrider: overrider}
 }
 
 func newAdapters(cfg config.Config) ([]channels.Adapter, error) {
@@ -238,7 +354,7 @@ func newAdapters(cfg config.Config) ([]channels.Adapter, error) {
 	return result, nil
 }
 
-func runCombined(addr string, gatewayService *gateway.Service, workerService *worker.Worker, runtime *executor.Runtime) error {
+func runCombined(addr string, gatewayService *gateway.Service, workerService *worker.Worker, runtime *executor.Runtime, admin httpapi.AdminConfig) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	gatewayErr := make(chan error, 1)
@@ -247,7 +363,7 @@ func runCombined(addr string, gatewayService *gateway.Service, workerService *wo
 	loops.Add(2)
 	go func() { defer loops.Done(); gatewayErr <- gatewayService.Run(ctx) }()
 	go func() { defer loops.Done(); workerErr <- workerService.Run(ctx) }()
-	server := newHTTPServer(addr, httpapi.NewHandler(combinedBackend{gateway: gatewayService, worker: workerService}))
+	server := newHTTPServer(addr, httpapi.NewHandlerWithAdmin(combinedBackend{gateway: gatewayService, worker: workerService}, admin))
 	serverErr := listen(server)
 
 	var runErr error
@@ -280,6 +396,10 @@ func (b combinedBackend) Ready(ctx context.Context) error {
 	return b.worker.Ready(ctx)
 }
 
+func (b combinedBackend) TraceDigestV2Enabled() bool {
+	return b.gateway.TraceDigestV2Enabled()
+}
+
 func (b combinedBackend) Handle(ctx context.Context, inbound message.InboundMessage) (message.OutboundMessage, error) {
 	return b.gateway.Handle(ctx, inbound)
 }
@@ -292,14 +412,14 @@ func (b combinedBackend) Snapshot(ctx context.Context, channel, bindingID, messa
 	return b.gateway.Snapshot(ctx, channel, bindingID, messageID)
 }
 
-func runGatewayServer(addr string, service *gateway.Service) error {
+func runGatewayServer(addr string, service *gateway.Service, admin httpapi.AdminConfig) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	runErr := make(chan error, 1)
 	var loop sync.WaitGroup
 	loop.Add(1)
 	go func() { defer loop.Done(); runErr <- service.Run(ctx) }()
-	server := newHTTPServer(addr, httpapi.NewHandler(service))
+	server := newHTTPServer(addr, httpapi.NewHandlerWithAdmin(service, admin))
 	serverErr := listen(server)
 	var err error
 	select {
