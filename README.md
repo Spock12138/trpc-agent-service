@@ -277,3 +277,12 @@ PostgreSQL `session/postgres v1.11.0` 的跨时区 Summary 缺陷仍存在，因
 ```bash
 ./stop.sh
 ```
+
+### Phase 7 deployment delivery
+
+Phase 7 adds reproducible `full`, `light`, `obs`, and `ha` Compose modes,
+offline Model/Telegram mocks, SQL init/readiness commands, OTLP telemetry, and
+an automated fault matrix. Run `scripts/phase7/up.ps1 -Mode full`; the first
+run creates `compose/.env` and stops until required values are reviewed. See
+`docs/stage7-compose.md`, `docs/stage7-observability.md`, and
+`docs/stage7-final-design.md` for the runbook and design boundaries.
