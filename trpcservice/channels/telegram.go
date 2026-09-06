@@ -17,6 +17,7 @@ import (
 	"github.com/go-telegram/bot/models"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 type TelegramAdapter struct {
@@ -215,6 +216,8 @@ func (a *TelegramAdapter) getUpdates(ctx context.Context) ([]*models.Update, err
 }
 
 func (a *TelegramAdapter) handleUpdate(ctx context.Context, sink IngressSink, update *models.Update) error {
+	ctx, span := telemetry.Start(ctx, "channel.ingress")
+	defer span.End()
 	if update == nil || update.Message == nil || update.Message.From == nil {
 		return errTelegramUnsupported
 	}

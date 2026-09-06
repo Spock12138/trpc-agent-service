@@ -58,3 +58,16 @@ func TestSQLBackendConcurrentClose(t *testing.T) {
 		t.Fatalf("Ready after Close error = %v", err)
 	}
 }
+
+func TestSQLBackendHealthFailureResetsResourcesForReconnect(t *testing.T) {
+	backend := &SQLBackend{profile: tenant.StorageProfile{Kind: tenant.StorageKindMySQL}, initialized: true, generation: 7, healthCheck: func(context.Context) error { return errors.New("connection lost") }}
+	if err := backend.Ready(context.Background()); !errors.Is(err, persistence.ErrBackendUnavailable) {
+		t.Fatalf("Ready error=%v", err)
+	}
+	if backend.initialized || backend.healthCheck != nil || backend.sessions != nil || backend.memories != nil || backend.committer != nil {
+		t.Fatal("failed SQL resources were not reset")
+	}
+	if generation := backend.ResourceGeneration(); generation != 7 {
+		t.Fatalf("failed reset advanced resource generation to %d", generation)
+	}
+}

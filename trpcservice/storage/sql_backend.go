@@ -18,6 +18,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -39,6 +40,7 @@ type SQLBackend struct {
 	mu          sync.Mutex
 	closed      bool
 	initialized bool
+	generation  uint64
 	sessions    sessionfence.StagingSession
 	memories    frameworkmemory.Service
 	committer   persistence.Committer
@@ -70,6 +72,8 @@ func (b *SQLBackend) String() string {
 func (b *SQLBackend) GoString() string { return b.String() }
 
 func (b *SQLBackend) Ready(ctx context.Context) error {
+	ctx, span := telemetry.Start(ctx, "storage.ready")
+	defer span.End()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -80,6 +84,12 @@ func (b *SQLBackend) Ready(ctx context.Context) error {
 	}
 	if b.initialized {
 		if err := b.healthCheck(ctx); err != nil {
+			telemetry.RecordStorageError(ctx, string(b.profile.Kind), "sql_unavailable")
+			// A live SQL resource can become unusable after a database restart.
+			// Release all stale clients before rebuilding them on the next Ready
+			// call; this keeps recovery in-process and does not alter persistence
+			// ordering or schema validation.
+			_ = b.closeResourcesLocked()
 			return persistence.ErrBackendUnavailable
 		}
 		return nil
@@ -89,7 +99,16 @@ func (b *SQLBackend) Ready(ctx context.Context) error {
 		return err
 	}
 	b.initialized = true
+	b.generation++
 	return nil
+}
+
+// ResourceGeneration changes whenever Session and Memory clients are rebuilt.
+// Cached runners use it to stop borrowing services closed after a SQL restart.
+func (b *SQLBackend) ResourceGeneration() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.generation
 }
 
 func (b *SQLBackend) initializeLocked(ctx context.Context) (err error) {

@@ -65,9 +65,13 @@ type ChannelBinding struct {
 	CredentialRef     string `json:"credential_ref,omitempty"`
 	BotIDRef          string `json:"bot_id_ref,omitempty"`
 	BotSecretRef      string `json:"bot_secret_ref,omitempty"`
-	TenantID          string `json:"tenant_id"`
-	AgentAppID        string `json:"agent_app_id"`
-	Enabled           bool   `json:"enabled"`
+	// ServerURL is an optional provider endpoint override. It is currently
+	// consumed only by Telegram bindings so local mocks can be used without
+	// changing the default official endpoint.
+	ServerURL  string `json:"server_url,omitempty"`
+	TenantID   string `json:"tenant_id"`
+	AgentAppID string `json:"agent_app_id"`
+	Enabled    bool   `json:"enabled"`
 }
 
 type ModelConfig struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	frameworkmemory "trpc.group/trpc-go/trpc-agent-go/memory"
 	frameworkrunner "trpc.group/trpc-go/trpc-agent-go/runner"
@@ -29,10 +30,12 @@ type ConfiguredRunnerFactory func(
 ) (frameworkrunner.Runner, error)
 
 type RunnerRegistry struct {
-	repository  tenant.Repository
-	backends    *storage.BackendProvider
-	credentials config.CredentialResolver
-	cache       *RunnerCache
+	repository   tenant.Repository
+	backends     *storage.BackendProvider
+	credentials  config.CredentialResolver
+	cache        *RunnerCache
+	generationMu sync.Mutex
+	generations  map[CacheKey]uint64
 }
 
 func NewRunnerRegistry(
@@ -58,6 +61,7 @@ func NewRunnerRegistry(
 		repository:  repository,
 		backends:    backends,
 		credentials: credentials,
+		generations: make(map[CacheKey]uint64),
 	}
 	cache, err := NewRunnerCache(cacheConfig, func(ctx context.Context, key CacheKey) (frameworkrunner.Runner, error) {
 		configVersion, backend, err := registry.resolve(ctx, key)
@@ -99,11 +103,33 @@ func (r *RunnerRegistry) Acquire(ctx context.Context, key CacheKey) (*RegistryLe
 	if err != nil {
 		return nil, err
 	}
-	lease, err := r.cache.Acquire(ctx, key)
+	generation := uint64(0)
+	if source, ok := backend.(interface{ ResourceGeneration() uint64 }); ok {
+		generation = source.ResourceGeneration()
+	}
+	lease, err := r.acquireGeneration(ctx, key, generation)
 	if err != nil {
 		return nil, err
 	}
 	return &RegistryLease{Runner: lease.Runner, Backend: backend, lease: lease}, nil
+}
+
+func (r *RunnerRegistry) acquireGeneration(ctx context.Context, key CacheKey, generation uint64) (*Lease, error) {
+	if generation == 0 {
+		return r.cache.Acquire(ctx, key)
+	}
+	r.generationMu.Lock()
+	defer r.generationMu.Unlock()
+	if previous, ok := r.generations[key]; ok && previous != generation {
+		if err := r.cache.Drain(ctx, key); err != nil {
+			return nil, fmt.Errorf("%w: refresh stale storage runner: %v", ErrRegistryDependency, err)
+		}
+	}
+	lease, err := r.cache.Acquire(ctx, key)
+	if err == nil {
+		r.generations[key] = generation
+	}
+	return lease, err
 }
 
 func (r *RunnerRegistry) resolve(ctx context.Context, key CacheKey) (tenant.ConfigVersion, storage.Backend, error) {
@@ -133,7 +159,11 @@ func (r *RunnerRegistry) Ready(ctx context.Context) error {
 }
 
 func (r *RunnerRegistry) Drain(ctx context.Context, key CacheKey) error {
-	return r.cache.Drain(ctx, key)
+	r.generationMu.Lock()
+	defer r.generationMu.Unlock()
+	err := r.cache.Drain(ctx, key)
+	delete(r.generations, key)
+	return err
 }
 
 func (r *RunnerRegistry) Close() error {

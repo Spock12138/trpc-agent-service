@@ -109,6 +109,48 @@ func TestRunnerRegistryFailsClosedForMissingCredential(t *testing.T) {
 	}
 }
 
+func TestRunnerRegistryRefreshesRunnerWhenBackendGenerationChanges(t *testing.T) {
+	var created []*fakeRunner
+	cache, err := NewRunnerCache(DefaultCacheConfig(), func(context.Context, CacheKey) (frameworkrunner.Runner, error) {
+		runner := &fakeRunner{}
+		created = append(created, runner)
+		return runner, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := &RunnerRegistry{cache: cache, generations: make(map[CacheKey]uint64)}
+	defer registry.Close()
+	key := CacheKey{TenantID: "tenant-a", AgentAppID: "assistant", ConfigVersion: "v1"}
+
+	first, err := registry.acquireGeneration(context.Background(), key, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRunner := first.Runner
+	first.Release()
+	second, err := registry.acquireGeneration(context.Background(), key, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Runner != firstRunner || len(created) != 1 {
+		t.Fatalf("same generation created a new runner: runners=%d", len(created))
+	}
+	second.Release()
+
+	third, err := registry.acquireGeneration(context.Background(), key, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer third.Release()
+	if third.Runner == firstRunner || len(created) != 2 {
+		t.Fatalf("new generation did not replace runner: runners=%d", len(created))
+	}
+	if got := created[0].closeCount.Load(); got != 1 {
+		t.Fatalf("stale runner close count=%d, want 1", got)
+	}
+}
+
 func registryCatalog() tenant.Catalog {
 	model := tenant.ModelConfig{
 		Name: "model", BaseURL: "https://example.test", CredentialRef: "env:MODEL_KEY",
