@@ -19,6 +19,15 @@ type fakeControlRepository struct {
 	err    error
 }
 
+func TestExecutionErrorCaptureKeepsFirstError(t *testing.T) {
+	ctx, captured := WithExecutionErrorCapture(context.Background())
+	captureExecutionError(ctx, ErrToolForbidden)
+	captureExecutionError(ctx, ErrPolicyUnavailable)
+	if !errors.Is(captured(), ErrToolForbidden) {
+		t.Fatalf("captured=%v", captured())
+	}
+}
+
 type recordingAuditSink struct {
 	records []control.AuditRecord
 }

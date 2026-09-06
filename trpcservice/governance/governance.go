@@ -18,6 +18,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/control"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 var (
@@ -333,6 +334,7 @@ const (
 	actorHashContextKey
 	sessionContextKey
 	taskAuditContextKey
+	executionErrorContextKey
 )
 
 type AuditSink interface {
@@ -345,6 +347,37 @@ type taskAuditContext struct {
 	actorHash     string
 	sessionIDHash string
 	sequence      atomic.Int64
+}
+
+type executionErrorState struct {
+	mu  sync.Mutex
+	err error
+}
+
+// WithExecutionErrorCapture preserves callback-level governance errors that
+// the framework otherwise projects as a generic agent error event.
+func WithExecutionErrorCapture(ctx context.Context) (context.Context, func() error) {
+	state := &executionErrorState{}
+	return context.WithValue(ctx, executionErrorContextKey, state), func() error {
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		return state.err
+	}
+}
+
+func captureExecutionError(ctx context.Context, err error) {
+	if ctx == nil || err == nil {
+		return
+	}
+	state, _ := ctx.Value(executionErrorContextKey).(*executionErrorState)
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	if state.err == nil {
+		state.err = err
+	}
+	state.mu.Unlock()
 }
 
 func WithPolicy(ctx context.Context, snapshot PolicySnapshot) context.Context {
@@ -413,20 +446,26 @@ func AuthorizeToolCall(ctx context.Context, toolName string, arguments []byte) (
 		return "", ErrPolicyUnavailable
 	}
 	if err := ToolAllowed(snapshot.Policy, toolName); err != nil {
+		captureExecutionError(ctx, err)
+		telemetry.RecordTool(ctx, "rejected")
 		return "", err
 	}
 	if !IsDangerous(snapshot.Policy, toolName) {
+		telemetry.RecordTool(ctx, "allowed")
 		return "", nil
 	}
 	manager, actorHash, sessionID, ok := ConfirmationFromContext(ctx)
 	if !ok || manager == nil {
 		emitTaskAudit(ctx, "denied", "denied", "confirmation_denied", toolName)
+		captureExecutionError(ctx, ErrDangerousConfirmation)
+		telemetry.RecordTool(ctx, "confirmation_required")
 		return "", ErrDangerousConfirmation
 	}
 	digest := sha256.Sum256(arguments)
 	argsDigest := hex.EncodeToString(digest[:])
 	consumeErr := manager.ConsumeMatching(ctx, snapshot.Policy.TenantID, actorHash, sessionID, toolName, argsDigest)
 	if consumeErr == nil {
+		telemetry.RecordTool(ctx, "succeeded")
 		emitTaskAudit(ctx, "allowed", "allowed", "", toolName)
 		return "", nil
 	}
@@ -442,6 +481,7 @@ func AuthorizeToolCall(ctx context.Context, toolName string, arguments []byte) (
 		return "", err
 	}
 	emitTaskAudit(ctx, "confirmation_required", "confirmation_required", "", toolName)
+	telemetry.RecordTool(ctx, "confirmation_required")
 	return confirmation.Nonce, nil
 }
 

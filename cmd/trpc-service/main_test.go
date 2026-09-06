@@ -37,6 +37,12 @@ func TestParseServeArgs(t *testing.T) {
 	}
 }
 
+func TestSQLCommandRejectsInvalidKindBeforeLoadingConfig(t *testing.T) {
+	if err := runSQLInit([]string{"-kind", "sqlite"}, false); err == nil {
+		t.Fatal("expected invalid kind error")
+	}
+}
+
 func TestNewAdaptersKeepsMissingCredentialNotReady(t *testing.T) {
 	cfg := adapterTestConfig(t, []tenant.ChannelBinding{{
 		ID: "telegram-a", Channel: "telegram", ExternalAccountID: "123", CredentialRef: "env:TELEGRAM_A",

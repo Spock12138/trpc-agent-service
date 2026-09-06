@@ -24,6 +24,15 @@ type fakeExecutor struct {
 	block    time.Duration
 }
 
+func TestClassifyToolGovernanceErrors(t *testing.T) {
+	if code, retry := classify(governance.ErrToolForbidden); code != "tool_rejected" || retry {
+		t.Fatalf("forbidden=(%q,%t)", code, retry)
+	}
+	if code, retry := classify(governance.ErrDangerousConfirmation); code != "confirmation_required" || retry {
+		t.Fatalf("confirmation=(%q,%t)", code, retry)
+	}
+}
+
 type denyingExecutor struct {
 	fakeExecutor
 	err error

@@ -37,9 +37,10 @@ type fakeAsyncBackend struct {
 	accept   func(message.InboundMessage) (channels.AcceptResult, error)
 	snapshot messaging.Snapshot
 	snapErr  error
+	readyErr error
 }
 
-func (f *fakeAsyncBackend) Ready(context.Context) error { return nil }
+func (f *fakeAsyncBackend) Ready(context.Context) error { return f.readyErr }
 func (f *fakeAsyncBackend) Handle(context.Context, message.InboundMessage) (message.OutboundMessage, error) {
 	return message.OutboundMessage{}, nil
 }
@@ -267,6 +268,22 @@ func TestWebMessageSubmitUsesTrustedDemoChannel(t *testing.T) {
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/web/messages", strings.NewReader(`{"binding_id":"custom-demo","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("terminal duplicate status = %d", rec.Code)
+	}
+}
+
+func TestWebMessageSubmitRejectsWhenBackendIsNotReady(t *testing.T) {
+	backend := &fakeAsyncBackend{readyErr: errors.New("control plane unavailable")}
+	rec := httptest.NewRecorder()
+	NewHandler(backend).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/web/messages", strings.NewReader(`{"binding_id":"demo","message_id":"m1","external_user_id":"u1","conversation_id":"c1","text":"hello"}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["code"] != "not_ready" {
+		t.Fatalf("response = %#v, error=%v", body, err)
+	}
+	if backend.accepted.MessageID != "" {
+		t.Fatalf("not-ready backend accepted message: %#v", backend.accepted)
 	}
 }
 

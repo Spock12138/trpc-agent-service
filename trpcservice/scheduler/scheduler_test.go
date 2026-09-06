@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -68,6 +69,26 @@ func TestReconcilerOwnersAreUnique(t *testing.T) {
 	second := NewReconciler(nil, nil)
 	if first.owner == second.owner {
 		t.Fatalf("reconciler owners collided: %q", first.owner)
+	}
+}
+
+func TestReconcilerAssignmentBatchDoesNotStarveTail(t *testing.T) {
+	assignments := make([]control.NodeAssignment, 130)
+	for i := range assignments {
+		assignments[i].InboxID = fmt.Sprintf("inbox-%03d", i)
+	}
+	reconciler := NewReconciler(nil, nil)
+	first := reconciler.nextAssignmentBatch(assignments, 64)
+	second := reconciler.nextAssignmentBatch(assignments, 64)
+	third := reconciler.nextAssignmentBatch(assignments, 64)
+	if first[0].InboxID != "inbox-000" || first[63].InboxID != "inbox-063" {
+		t.Fatalf("first batch = %q..%q", first[0].InboxID, first[63].InboxID)
+	}
+	if second[0].InboxID != "inbox-064" || second[63].InboxID != "inbox-127" {
+		t.Fatalf("second batch = %q..%q", second[0].InboxID, second[63].InboxID)
+	}
+	if third[0].InboxID != "inbox-128" || third[1].InboxID != "inbox-129" || third[2].InboxID != "inbox-000" {
+		t.Fatalf("third batch did not wrap: %q,%q,%q", third[0].InboxID, third[1].InboxID, third[2].InboxID)
 	}
 }
 

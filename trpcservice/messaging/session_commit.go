@@ -56,7 +56,11 @@ func (s *Store) CompleteTurn(ctx context.Context, lease Lease, reply message.Out
 	}
 	target := lease.Delivery.Task.DeliveryTarget()
 	reply = target.Apply(reply)
-	result := message.TaskResult{SchemaVersion: message.TaskSchemaVersion, TaskID: lease.Delivery.Task.TaskID, Succeeded: true, Channel: target.Channel, BindingID: target.ChannelBindingID, Reply: reply, TraceID: lease.Delivery.Task.TraceID}
+	result := message.TaskResult{
+		SchemaVersion: message.TaskSchemaVersion, TaskID: task.TaskID, Succeeded: true,
+		Channel: target.Channel, BindingID: target.ChannelBindingID, Reply: reply,
+		TraceID: task.TraceID, TraceParent: task.TraceParent, DigestVersion: task.DigestVersion,
+	}
 	if target.Valid() {
 		result.Target = target
 	}

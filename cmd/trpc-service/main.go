@@ -29,6 +29,8 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/routing"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
@@ -54,6 +56,10 @@ func main() {
 		err = runGateway(os.Args[2:])
 	case "worker":
 		err = runWorker(os.Args[2:])
+	case "sql-init":
+		err = runSQLInit(os.Args[2:], false)
+	case "sql-ready":
+		err = runSQLInit(os.Args[2:], true)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		printUsage(os.Stderr)
@@ -66,7 +72,37 @@ func main() {
 }
 
 func printUsage(output io.Writer) {
-	fmt.Fprintf(output, "usage:\n  %s serve [-addr 127.0.0.1:8080]\n  %s gateway [-addr 127.0.0.1:8080] [-consumer name]\n  %s worker [-health-addr :8081] [-consumer name]\n", os.Args[0], os.Args[0], os.Args[0])
+	fmt.Fprintf(output, "usage:\n  %s serve [-addr 127.0.0.1:8080]\n  %s gateway [-addr 127.0.0.1:8080] [-consumer name]\n  %s worker [-health-addr :8081] [-consumer name]\n  %s sql-init -kind postgres|mysql|all\n  %s sql-ready -kind postgres|mysql|all\n", os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
+}
+
+func runSQLInit(args []string, readyOnly bool) error {
+	flags := flag.NewFlagSet("sql", flag.ContinueOnError)
+	kind := flags.String("kind", "", "postgres|mysql|all")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	requested := strings.ToLower(strings.TrimSpace(*kind))
+	if requested != "postgres" && requested != "mysql" && requested != "all" {
+		return errors.New("-kind must be postgres, mysql, or all")
+	}
+	cfg, err := config.LoadForRole(config.RoleWorker)
+	if err != nil {
+		return err
+	}
+	catalog, resolver, err := cfg.RuntimeCatalog()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	results, err := storage.InitializeSQLProfiles(ctx, catalog.StorageProfiles, resolver, requested, readyOnly)
+	if err != nil {
+		return err
+	}
+	for _, result := range results {
+		fmt.Printf("sql-%s ok tenant=%s profile=%s kind=%s\n", map[bool]string{true: "ready", false: "init"}[readyOnly], result.TenantID, result.ProfileID, result.Kind)
+	}
+	return nil
 }
 
 func serve(args []string) error {
@@ -78,6 +114,11 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	telemetryProvider, err := initTelemetry(cfg)
+	if err != nil {
+		return err
+	}
+	defer telemetryProvider.Close(context.Background())
 	store, err := messaging.NewStore(*cfg.Messaging)
 	if err != nil {
 		return err
@@ -132,12 +173,12 @@ func serve(args []string) error {
 		if gatewayErr != nil {
 			return gatewayErr
 		}
-		gatewayAudit, gatewayErr := configureGatewayGovernance(cfg, controlRepository, gatewayService)
+		gatewaySinks, gatewayErr := configureGatewayGovernance(cfg, controlRepository, gatewayService)
 		if gatewayErr != nil {
 			return gatewayErr
 		}
-		defer gatewayAudit.Close()
-		return runCombined(addr, gatewayService, workerService, runtime, adminHTTPConfig(cfg, controlRepository, assignmentScheduler))
+		defer gatewaySinks.Close()
+		return runCombined(addr, gatewayService, workerService, runtime, adminHTTPConfig(cfg, controlRepository, assignmentScheduler, store))
 	}
 	if err != nil {
 		return err
@@ -164,6 +205,11 @@ func runGateway(args []string) error {
 	if err != nil {
 		return err
 	}
+	telemetryProvider, err := initTelemetry(cfg)
+	if err != nil {
+		return err
+	}
+	defer telemetryProvider.Close(context.Background())
 	store, err := messaging.NewStore(*cfg.Messaging)
 	if err != nil {
 		return err
@@ -200,25 +246,42 @@ func runGateway(args []string) error {
 		return err
 	}
 	if controlRepository != nil {
-		gatewayAudit, governanceErr := configureGatewayGovernance(cfg, controlRepository, service)
+		gatewaySinks, governanceErr := configureGatewayGovernance(cfg, controlRepository, service)
 		if governanceErr != nil {
 			return governanceErr
 		}
-		defer gatewayAudit.Close()
+		defer gatewaySinks.Close()
 	}
-	return runGatewayServer(addr, service, adminHTTPConfig(cfg, controlRepository, assignmentScheduler))
+	return runGatewayServer(addr, service, adminHTTPConfig(cfg, controlRepository, assignmentScheduler, store))
 }
 
-func configureGatewayGovernance(cfg config.Config, repository control.Repository, service *gateway.Service) (*metrics.AsyncAuditSink, error) {
+type gatewaySinks struct {
+	audit         *metrics.AsyncAuditSink
+	metric        *metrics.AsyncMetricSink
+	restoreMetric func()
+}
+
+func (s *gatewaySinks) Close() error {
+	if s == nil {
+		return nil
+	}
+	if s.restoreMetric != nil {
+		s.restoreMetric()
+	}
+	return errors.Join(s.metric.Close(), s.audit.Close())
+}
+
+func configureGatewayGovernance(cfg config.Config, repository control.Repository, service *gateway.Service) (*gatewaySinks, error) {
 	cache, err := governance.NewPolicyCache(repository, cfg.ControlPlane.PolicyCacheTTL)
 	if err != nil {
 		return nil, err
 	}
-	sink := metrics.NewAuditSink(repository, 256)
+	auditSink := metrics.NewAuditSink(repository, 256)
+	metricSink := metrics.NewMetricSink(repository, 256)
 	enforcer := governance.NewPolicyEnforcer(cache, cfg.IdentitySecret, repository)
-	enforcer.SetAuditSink(sink)
+	enforcer.SetAuditSink(auditSink)
 	service.SetTaskAuthorizer(enforcer)
-	return sink, nil
+	return &gatewaySinks{audit: auditSink, metric: metricSink, restoreMetric: telemetry.SetMetricEventSink(metricSink)}, nil
 }
 
 func runWorker(args []string) error {
@@ -236,6 +299,11 @@ func runWorker(args []string) error {
 	if err != nil {
 		return err
 	}
+	telemetryProvider, err := initTelemetry(cfg)
+	if err != nil {
+		return err
+	}
+	defer telemetryProvider.Close(context.Background())
 	store, err := messaging.NewStore(*cfg.Messaging)
 	if err != nil {
 		return err
@@ -247,6 +315,16 @@ func runWorker(args []string) error {
 	}
 	if controlRepository != nil {
 		defer controlRepository.Close()
+	}
+	var workerMetrics *metrics.AsyncMetricSink
+	var restoreWorkerMetrics func()
+	if controlRepository != nil {
+		workerMetrics = metrics.NewMetricSink(controlRepository, 256)
+		restoreWorkerMetrics = telemetry.SetMetricEventSink(workerMetrics)
+		defer func() {
+			restoreWorkerMetrics()
+			_ = workerMetrics.Close()
+		}()
 	}
 	runtime, err := executor.New(cfg)
 	if err != nil {
@@ -284,6 +362,11 @@ func newRouter(cfg config.Config) (*routing.Router, error) {
 	return routing.NewWithDigestV2(repository, cfg.IdentitySecret, cfg.ControlPlane != nil && cfg.ControlPlane.TraceDigestV2Enabled)
 }
 
+func initTelemetry(cfg config.Config) (*telemetry.Provider, error) {
+	obs := cfg.Observability
+	return telemetry.New(context.Background(), telemetry.Config{Enabled: obs.Enabled, Endpoint: obs.Endpoint, ServiceName: obs.ServiceName, ServiceVersion: trpcservice.Version, ServiceInstanceID: strings.TrimSpace(os.Getenv("OTEL_SERVICE_INSTANCE_ID")), SampleRatio: obs.SampleRatio, SpanQueueSize: obs.SpanQueueSize, SpanBatchSize: obs.SpanBatchSize, SpanBatchTimeout: obs.ScheduleDelay, ExportTimeout: obs.ExportTimeout, MetricInterval: obs.MetricInterval, MetricExportTimeout: obs.ExportTimeout})
+}
+
 func newControlRepository(cfg config.Config) (control.Repository, error) {
 	if cfg.ControlPlane == nil {
 		return nil, nil
@@ -298,11 +381,49 @@ func newControlRepository(cfg config.Config) (control.Repository, error) {
 
 func adminHTTPConfig(cfg config.Config, repository control.Repository, overrider interface {
 	Override(context.Context, string, string) (control.NodeAssignment, error)
-}) httpapi.AdminConfig {
+}, store *messaging.Store) httpapi.AdminConfig {
 	if cfg.ControlPlane == nil || repository == nil {
 		return httpapi.AdminConfig{}
 	}
-	return httpapi.AdminConfig{Repository: repository, Token: cfg.ControlPlane.AdminToken, AssignmentOverrider: overrider}
+	admin := httpapi.AdminConfig{Repository: repository, Token: cfg.ControlPlane.AdminToken, AssignmentOverrider: overrider}
+	if store != nil {
+		admin.TaskLookup = func(ctx context.Context, bindingID, messageID string) (map[string]any, error) {
+			tenantID := ""
+			for _, binding := range cfg.Catalog.ChannelBindings {
+				if binding.ID == bindingID {
+					tenantID = binding.TenantID
+					break
+				}
+			}
+			if tenantID == "" {
+				return nil, tenant.ErrBindingNotFound
+			}
+			inbox := (message.ExecutionTask{TenantID: tenantID, ChannelBindingID: bindingID, PlatformMessageID: messageID}).InboxID()
+			snapshot, err := store.Snapshot(ctx, inbox)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"task_id": snapshot.TaskID, "state": snapshot.State, "attempt": snapshot.Attempt, "error_code": snapshot.ErrorCode, "node_id": snapshot.NodeID, "assignment_state": snapshot.AssignmentState, "persist_attempt": snapshot.PersistAttempt}, nil
+		}
+		admin.OutboundLookup = func(ctx context.Context, taskID string) (map[string]any, error) {
+			value, err := store.OutboundSnapshot(ctx, taskID)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"task_id": taskID, "state": value.Status, "attempt": value.Attempts, "error_code": value.LastError}, nil
+		}
+	}
+	admin.ReconcilerStatus = func(ctx context.Context) (map[string]any, error) {
+		if err := repository.Ready(ctx); err != nil {
+			return nil, err
+		}
+		leader := false
+		if status, ok := overrider.(interface{ IsLeader() bool }); ok {
+			leader = status.IsLeader()
+		}
+		return map[string]any{"is_leader": leader, "node_id": strings.TrimSpace(os.Getenv("NODE_ID"))}, nil
+	}
+	return admin
 }
 
 func newAdapters(cfg config.Config) ([]channels.Adapter, error) {
@@ -323,7 +444,7 @@ func newAdapters(cfg config.Config) ([]channels.Adapter, error) {
 			token, resolveErr := resolver.Resolve(binding.CredentialRef)
 			if resolveErr == nil {
 				identityValue = token
-				adapter, err = channels.NewTelegramAdapter(binding.ID, binding.ExternalAccountID, token, "")
+				adapter, err = channels.NewTelegramAdapter(binding.ID, binding.ExternalAccountID, token, binding.ServerURL)
 			}
 			if resolveErr != nil {
 				adapter = &channels.UnavailableAdapter{BindingID: binding.ID}

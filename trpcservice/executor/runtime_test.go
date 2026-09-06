@@ -129,24 +129,35 @@ func TestCollectTextStreamingEmptyAndErrorEvents(t *testing.T) {
 		Choices: []model.Choice{{Delta: model.NewAssistantMessage("world")}},
 	}}
 	close(events)
-	text, err := collectText(events)
+	text, err := collectText(context.Background(), events)
 	if err != nil || text != "hello world" {
 		t.Fatalf("collectText() = (%q, %v), want streaming text", text, err)
 	}
 
 	empty := make(chan *event.Event)
 	close(empty)
-	if _, err := collectText(empty); !errors.Is(err, ErrEmptyAgentResponse) {
+	if _, err := collectText(context.Background(), empty); !errors.Is(err, ErrEmptyAgentResponse) {
 		t.Fatalf("collectText(empty) error = %v, want ErrEmptyAgentResponse", err)
 	}
 
 	failed := make(chan *event.Event, 1)
 	failed <- &event.Event{Response: &model.Response{Error: &model.ResponseError{Message: "upstream-secret-detail"}}}
 	close(failed)
-	if _, err := collectText(failed); !errors.Is(err, ErrAgentFailed) {
+	if _, err := collectText(context.Background(), failed); !errors.Is(err, ErrAgentFailed) {
 		t.Fatalf("collectText(error) error = %v, want ErrAgentFailed", err)
 	} else if strings.Contains(err.Error(), "upstream-secret-detail") {
 		t.Fatalf("collectText leaked upstream error detail: %v", err)
+	}
+}
+
+func TestContextDeadlineExceededUsesElapsedDeadline(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer cancel()
+	if !contextDeadlineExceeded(ctx) {
+		t.Fatal("elapsed deadline was not detected")
+	}
+	if contextDeadlineExceeded(context.Background()) {
+		t.Fatal("background context was classified as timed out")
 	}
 }
 

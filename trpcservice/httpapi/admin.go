@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/control"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 type AdminConfig struct {
@@ -19,6 +20,9 @@ type AdminConfig struct {
 	AssignmentOverrider interface {
 		Override(context.Context, string, string) (control.NodeAssignment, error)
 	}
+	TaskLookup       func(context.Context, string, string) (map[string]any, error)
+	OutboundLookup   func(context.Context, string) (map[string]any, error)
+	ReconcilerStatus func(context.Context) (map[string]any, error)
 }
 
 func NewHandlerWithAdmin(backend Backend, admin AdminConfig) http.Handler {
@@ -34,13 +38,20 @@ func NewHandlerWithAdmin(backend Backend, admin AdminConfig) http.Handler {
 		root.HandleFunc("/api/v1/web/messages/", webSnapshotHandler(async))
 		root.Handle("/", webUIHandler())
 	}
-	root.Handle("/api/v1/admin/", adminHandler(admin.Repository, admin.AssignmentOverrider, control.NewAdminAuthenticator(admin.Token)))
+	root.Handle("/api/v1/admin/", adminHandlerWithLookups(admin.Repository, admin.AssignmentOverrider, control.NewAdminAuthenticator(admin.Token), admin.TaskLookup, admin.OutboundLookup, admin.ReconcilerStatus))
 	root.Handle("/admin/", adminUIHandler())
 	return root
 }
 
 func adminUIHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		spanName := "admin.query"
+		if r.Method != http.MethodGet {
+			spanName = "admin.mutation"
+		}
+		ctx, span := telemetry.Start(r.Context(), spanName)
+		defer span.End()
+		r = r.WithContext(ctx)
 		if r.URL.Path != "/admin/" && r.URL.Path != "/admin" {
 			http.NotFound(w, r)
 			return
@@ -59,6 +70,12 @@ const adminUIHTML = `<!doctype html>
 func adminHandler(repository control.Repository, overrider interface {
 	Override(context.Context, string, string) (control.NodeAssignment, error)
 }, authenticator control.AdminAuthenticator) http.Handler {
+	return adminHandlerWithLookups(repository, overrider, authenticator, nil, nil, nil)
+}
+
+func adminHandlerWithLookups(repository control.Repository, overrider interface {
+	Override(context.Context, string, string) (control.NodeAssignment, error)
+}, authenticator control.AdminAuthenticator, taskLookup func(context.Context, string, string) (map[string]any, error), outboundLookup func(context.Context, string) (map[string]any, error), reconcilerStatus func(context.Context) (map[string]any, error)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := authenticator.Authenticate(r.Header.Get("Authorization")); err != nil {
 			if errors.Is(err, control.ErrAdminAPIDisabled) {
@@ -69,6 +86,45 @@ func adminHandler(repository control.Repository, overrider interface {
 			return
 		}
 		parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/"), "/"), "/")
+		if len(parts) == 1 && parts[0] == "reconciler" && r.Method == http.MethodGet {
+			if reconcilerStatus == nil {
+				adminUnavailable(w)
+				return
+			}
+			value, err := reconcilerStatus(r.Context())
+			if err != nil {
+				adminUnavailable(w)
+				return
+			}
+			writeJSON(w, http.StatusOK, value)
+			return
+		}
+		if len(parts) == 3 && parts[0] == "tasks" && r.Method == http.MethodGet {
+			if taskLookup == nil {
+				adminUnavailable(w)
+				return
+			}
+			value, err := taskLookup(r.Context(), parts[1], parts[2])
+			if err != nil {
+				adminUnavailable(w)
+				return
+			}
+			writeJSON(w, http.StatusOK, value)
+			return
+		}
+		if len(parts) == 2 && parts[0] == "outbound" && r.Method == http.MethodGet {
+			if outboundLookup == nil {
+				adminUnavailable(w)
+				return
+			}
+			value, err := outboundLookup(r.Context(), parts[1])
+			if err != nil {
+				adminUnavailable(w)
+				return
+			}
+			writeJSON(w, http.StatusOK, value)
+			return
+		}
 		if len(parts) == 1 && parts[0] == "nodes" && r.Method == http.MethodGet {
 			nodes, err := repository.ListNodes(r.Context())
 			if err != nil {

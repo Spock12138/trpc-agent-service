@@ -8,6 +8,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/control"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/redaction"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 type AuditSink interface {
@@ -47,6 +48,7 @@ func (s *AsyncAuditSink) Emit(_ context.Context, record control.AuditRecord) {
 	case s.queue <- record:
 	default:
 		s.dropped.Add(1)
+		telemetry.RecordTelemetryDrop(context.Background(), "audit_sink", "queue_full")
 	}
 }
 
@@ -104,6 +106,7 @@ func (s *AsyncMetricSink) Record(_ context.Context, record control.MetricEvent) 
 	case s.queue <- record:
 	default:
 		s.dropped.Add(1)
+		telemetry.RecordTelemetryDrop(context.Background(), "metric_sink", "queue_full")
 	}
 }
 func (s *AsyncMetricSink) loop() {

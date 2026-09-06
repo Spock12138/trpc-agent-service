@@ -91,3 +91,30 @@ func TestNodeAssignmentUpdateAndBackfill(t *testing.T) {
 		t.Fatalf("updated projection = (%#v, %v)", snapshot, err)
 	}
 }
+
+func TestNodeAssignmentRunningCanBeReassignedAfterLeaseExpiry(t *testing.T) {
+	store, _ := newTestStore(t)
+	task := testTask("task-node-reassign", "message-node-reassign")
+	now := time.Now().UTC()
+	assignment := control.NodeAssignment{InboxID: task.InboxID(), TenantID: task.TenantID, AgentAppID: task.AgentAppID, PayloadDigest: task.PayloadDigest, NodeID: "worker-a", Mode: control.PlacementShared, State: control.AssignmentPlanned, Revision: 1, CreatedAt: now, UpdatedAt: now}
+	if _, _, err := store.SubmitAssigned(context.Background(), task, assignment); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.client.HSet(context.Background(), store.inboxKey(task.InboxID()), "assignment_state", string(control.AssignmentRunning), "state", StateQueued).Err(); err != nil {
+		t.Fatal(err)
+	}
+	next := assignment
+	next.NodeID = "worker-b"
+	next.State = control.AssignmentPlanned
+	next.Revision = 2
+	if err := store.UpdateNodeAssignment(context.Background(), task.InboxID(), task.TaskID, next, 1); err != nil {
+		t.Fatalf("expired running assignment should be reassignable: %v", err)
+	}
+	if err := store.client.HSet(context.Background(), store.inboxKey(task.InboxID()), "assignment_state", string(control.AssignmentRunning), "state", StateProcessing, "lease_until", time.Now().Add(time.Minute).UnixMilli()).Err(); err != nil {
+		t.Fatal(err)
+	}
+	next.Revision = 3
+	if err := store.UpdateNodeAssignment(context.Background(), task.InboxID(), task.TaskID, next, 2); !errors.Is(err, control.ErrAssignmentNotOverridable) {
+		t.Fatalf("live running assignment update = %v", err)
+	}
+}

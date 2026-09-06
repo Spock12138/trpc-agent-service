@@ -24,6 +24,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/redistopology"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 const (
@@ -265,6 +266,8 @@ func createGroup(ctx context.Context, client *redis.Client, stream, group string
 }
 
 func (s *Store) Submit(ctx context.Context, task message.ExecutionTask) (Snapshot, bool, error) {
+	ctx, span := telemetry.Start(ctx, "messaging.submit")
+	defer span.End()
 	return s.submit(ctx, task, nil)
 }
 

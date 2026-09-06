@@ -43,7 +43,11 @@ local inbox_type=redis.call('TYPE',KEYS[1]); local wait_type=redis.call('TYPE',K
 if inbox_type~='hash' or (wait_type~='none' and wait_type~='zset') then return inbox_type=='none' and -1 or -9 end
 if redis.call('HGET',KEYS[1],'task_id')~=ARGV[1] or redis.call('HGET',KEYS[1],'digest')~=ARGV[2] then return -2 end
 if tonumber(redis.call('HGET',KEYS[1],'assignment_revision') or '0')~=tonumber(ARGV[3]) then return 0 end
-local state=redis.call('HGET',KEYS[1],'assignment_state') or 'planned'; if state=='admitted' or state=='running' or state=='completed' then return -3 end
+local state=redis.call('HGET',KEYS[1],'assignment_state') or 'planned'; if state=='completed' then return -3 end
+if state=='admitted' or state=='running' then
+  local inbox_state=redis.call('HGET',KEYS[1],'state'); local lease_until=tonumber(redis.call('HGET',KEYS[1],'lease_until') or '0')
+  if (inbox_state=='processing' or inbox_state=='persisting') and lease_until>tonumber(ARGV[9]) then return -3 end
+end
 redis.call('HSET',KEYS[1],'node_id',ARGV[4],'assignment_revision',ARGV[5],'assignment_mode',ARGV[6],'assignment_state',ARGV[7],'assignment_payload_digest',ARGV[2])
 if ARGV[7]=='blocked' then redis.call('HSET',KEYS[1],'blocked_reason',ARGV[8]) else redis.call('HDEL',KEYS[1],'blocked_reason') end
 if redis.call('HGET',KEYS[1],'state')=='node_wait' then

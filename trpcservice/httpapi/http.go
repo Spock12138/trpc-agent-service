@@ -19,6 +19,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/redaction"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 const (
@@ -37,10 +38,7 @@ func NewHandler(backend Backend) http.Handler {
 	registerHealth(mux, backend)
 	digestV2 := traceDigestV2Enabled(backend)
 	mux.HandleFunc("/api/v1/demo/messages", messageHandler(backend, digestV2))
-	if async, ok := backend.(interface {
-		Accept(context.Context, message.InboundMessage) (channels.AcceptResult, error)
-		Snapshot(context.Context, string, string, string) (messaging.Snapshot, error)
-	}); ok {
+	if async, ok := backend.(asyncBackend); ok {
 		mux.HandleFunc("/api/v1/web/messages", webMessageHandler(async, digestV2))
 		mux.HandleFunc("/api/v1/web/messages/", webSnapshotHandler(async))
 		mux.Handle("/", webUIHandler())
@@ -49,6 +47,7 @@ func NewHandler(backend Backend) http.Handler {
 }
 
 type asyncBackend interface {
+	Ready(context.Context) error
 	Accept(context.Context, message.InboundMessage) (channels.AcceptResult, error)
 	Snapshot(context.Context, string, string, string) (messaging.Snapshot, error)
 }
@@ -63,6 +62,8 @@ type webMessageRequest struct {
 
 func webMessageHandler(backend asyncBackend, digestV2 bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		traceCtx, span := telemetry.Start(telemetry.ExtractTraceParent(r.Context(), r.Header.Get("traceparent")), "channel.ingress")
+		defer span.End()
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "", "")
 			return
@@ -91,7 +92,11 @@ func webMessageHandler(backend asyncBackend, digestV2 bool) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid_request", "invalid web message", requestID, traceID)
 			return
 		}
-		result, err := backend.Accept(r.Context(), message.InboundMessage{
+		if err := backend.Ready(traceCtx); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "not_ready", "service dependency unavailable", requestID, traceID)
+			return
+		}
+		result, err := backend.Accept(traceCtx, message.InboundMessage{
 			Channel: "demo", BindingID: input.BindingID, PlatformMessageID: input.MessageID, ActorUserID: input.ExternalUserID,
 			ConversationID: input.ConversationID, ConversationType: message.ConversationDirect, Text: input.Text,
 			RequestID: requestID, TraceID: traceID, TraceParent: gatedTraceParent(r, digestV2), ReceivedAt: time.Now().UTC(),
@@ -110,6 +115,8 @@ func webMessageHandler(backend asyncBackend, digestV2 bool) http.HandlerFunc {
 
 func webSnapshotHandler(backend asyncBackend) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		traceCtx, span := telemetry.Start(telemetry.ExtractTraceParent(r.Context(), r.Header.Get("traceparent")), "channel.snapshot")
+		defer span.End()
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "", "")
 			return
@@ -124,7 +131,7 @@ func webSnapshotHandler(backend asyncBackend) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid_request", "binding_id is required", "", "")
 			return
 		}
-		snapshot, err := backend.Snapshot(r.Context(), "demo", bindingID, messageID)
+		snapshot, err := backend.Snapshot(traceCtx, "demo", bindingID, messageID)
 		if err != nil {
 			if errors.Is(err, messaging.ErrInboxMissing) {
 				writeError(w, http.StatusNotFound, "message_not_found", "message not found", "", "")

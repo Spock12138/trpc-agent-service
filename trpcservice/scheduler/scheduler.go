@@ -19,6 +19,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 var (
@@ -44,6 +45,8 @@ func New(repository control.Repository, store *messaging.Store, enabled bool) (*
 func (s *Service) Enabled() bool { return s != nil && s.enabled }
 
 func (s *Service) Submit(ctx context.Context, task message.ExecutionTask) (messaging.Snapshot, bool, error) {
+	ctx, span := telemetry.Start(ctx, "scheduler.assign")
+	defer span.End()
 	if !s.enabled {
 		return s.store.Submit(ctx, task)
 	}
@@ -212,6 +215,7 @@ type Reconciler struct {
 	repository control.Repository
 	store      *messaging.Store
 	leader     atomic.Bool
+	scanCursor atomic.Uint64
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -287,6 +291,8 @@ func (r *Reconciler) run(ctx context.Context) {
 }
 
 func (r *Reconciler) ReconcileOnce(ctx context.Context, limit int) error {
+	ctx, span := telemetry.Start(ctx, "scheduler.reconcile")
+	defer span.End()
 	if r == nil || r.repository == nil || r.store == nil {
 		return nil
 	}
@@ -294,14 +300,12 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context, limit int) error {
 	if err != nil {
 		return err
 	}
-	if limit <= 0 || limit > len(assignments) {
-		limit = len(assignments)
-	}
+	assignments = r.nextAssignmentBatch(assignments, limit)
 	nodes, err := r.repository.ListNodes(ctx)
 	if err != nil {
 		return err
 	}
-	for _, assignment := range assignments[:limit] {
+	for _, assignment := range assignments {
 		if err := r.reconcileAssignment(ctx, assignment, nodes); err != nil && !errors.Is(err, control.ErrRevisionConflict) && !errors.Is(err, control.ErrAssignmentNotOverridable) {
 			return err
 		}
@@ -309,9 +313,31 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context, limit int) error {
 	return nil
 }
 
+func (r *Reconciler) nextAssignmentBatch(assignments []control.NodeAssignment, limit int) []control.NodeAssignment {
+	total := len(assignments)
+	if total == 0 {
+		return nil
+	}
+	if limit <= 0 || limit > total {
+		limit = total
+	}
+	start := int((r.scanCursor.Add(uint64(limit)) - uint64(limit)) % uint64(total))
+	batch := make([]control.NodeAssignment, limit)
+	for i := range batch {
+		batch[i] = assignments[(start+i)%total]
+	}
+	return batch
+}
+
 func (r *Reconciler) reconcileAssignment(ctx context.Context, assignment control.NodeAssignment, nodes []control.NodeRecord) error {
 	if assignment.State == control.AssignmentAdmitted || assignment.State == control.AssignmentRunning {
-		return nil
+		// Keep a live assignment pinned, but permit takeover after its node lease
+		// and heartbeat expire so another eligible worker can admit the task.
+		for _, node := range nodes {
+			if node.NodeID == assignment.NodeID && eligible(node, time.Now().UTC()) {
+				return nil
+			}
+		}
 	}
 	snapshot, err := r.store.Snapshot(ctx, assignment.InboxID)
 	if err != nil {
@@ -330,7 +356,12 @@ func (r *Reconciler) reconcileAssignment(ctx context.Context, assignment control
 		return err
 	}
 	if snapshot.State == messaging.StateProcessing || snapshot.State == messaging.StatePersisting {
-		return nil
+		// An in-flight task is left alone while its lease is valid. A killed
+		// worker leaves the inbox in this state until the lease expires; then
+		// normal placement must be allowed to hand it to another node.
+		if snapshot.LeaseUntil > time.Now().UnixMilli() {
+			return nil
+		}
 	}
 	placement, err := r.repository.GetPlacement(ctx, assignment.TenantID)
 	if err != nil {
@@ -357,7 +388,11 @@ func (r *Reconciler) reconcileAssignment(ctx context.Context, assignment control
 		return nil
 	}
 	next.Revision = assignment.Revision + 1
-	if err := r.store.UpdateNodeAssignment(ctx, assignment.InboxID, snapshot.TaskID, next, assignment.Revision); err != nil {
+	// The control repository revision advances on admitted/running transitions,
+	// while the Redis projection revision advances only when placement changes.
+	// Use the projection's CAS revision here; the repository write below still
+	// uses the control-plane revision.
+	if err := r.store.UpdateNodeAssignment(ctx, assignment.InboxID, snapshot.TaskID, next, snapshot.AssignmentRevision); err != nil {
 		return err
 	}
 	_, err = r.repository.PutAssignment(ctx, next, assignment.Revision)
@@ -417,6 +452,8 @@ func (c *Controller) Ready(ctx context.Context) error {
 }
 
 func (c *Controller) Admit(ctx context.Context, delivery messaging.Delivery) (bool, error) {
+	ctx, span := telemetry.Start(ctx, "worker.admit")
+	defer span.End()
 	if !c.enabled {
 		return true, nil
 	}
@@ -477,11 +514,15 @@ func (c *Controller) Admit(ctx context.Context, delivery messaging.Delivery) (bo
 		_, _ = c.repository.PutAssignment(ctx, assignment, assignment.Revision)
 	}
 	_ = c.repository.ClearTenantDegraded(ctx, delivery.Task.TenantID)
+	telemetry.RecordAssignment(ctx, "admitted", "")
+	telemetry.RecordDegraded(ctx, "false", "")
 	return true, nil
 }
 
 func (c *Controller) rejectAdmission(ctx context.Context, tenantID, reason string, err error) (bool, error) {
 	_ = c.repository.SetTenantDegraded(ctx, tenantID, reason)
+	telemetry.RecordAssignment(ctx, "rejected", reason)
+	telemetry.RecordDegraded(ctx, "true", reason)
 	return false, err
 }
 
@@ -494,6 +535,7 @@ func (c *Controller) MarkRunning(ctx context.Context, delivery messaging.Deliver
 		assignment.State = control.AssignmentRunning
 		_, _ = c.repository.PutAssignment(ctx, assignment, assignment.Revision)
 	}
+	telemetry.RecordAssignment(ctx, "running", "")
 }
 
 func (c *Controller) MarkCompleted(ctx context.Context, delivery messaging.Delivery) {
@@ -506,6 +548,7 @@ func (c *Controller) MarkCompleted(ctx context.Context, delivery messaging.Deliv
 		assignment.BlockedReason = ""
 		_, _ = c.repository.PutAssignment(ctx, assignment, assignment.Revision)
 	}
+	telemetry.RecordAssignment(ctx, "completed", "")
 }
 
 func (c *Controller) Promote(ctx context.Context, limit int) (int, error) {
@@ -516,6 +559,7 @@ func (c *Controller) Promote(ctx context.Context, limit int) (int, error) {
 }
 
 func (c *Controller) SetInflight(value int) {
+	telemetry.SetInflight(value)
 	if c.lifecycle != nil {
 		c.lifecycle.SetInflight(value)
 	}

@@ -20,6 +20,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/routing"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 var (
@@ -48,7 +49,24 @@ const agentFailureText = "抱歉，处理失败，请稍后重试。"
 
 // Accept is the asynchronous ingress contract used by IM adapters. It waits
 // only for the Inbox and task stream durable write, never for Agent execution.
-func (s *Service) Accept(ctx context.Context, inbound message.InboundMessage) (channels.AcceptResult, error) {
+func (s *Service) Accept(ctx context.Context, inbound message.InboundMessage) (result channels.AcceptResult, finalErr error) {
+	ctx, span := telemetry.Start(ctx, "gateway.submit")
+	defer span.End()
+	started := time.Now()
+	metricTenant := "unknown"
+	defer func() {
+		status := "succeeded"
+		if finalErr != nil {
+			status = "error"
+		}
+		telemetry.RecordRequest(ctx, metricTenant, inbound.Channel, status, time.Since(started).Seconds())
+	}()
+	if s.router.TraceDigestV2Enabled() {
+		if traceID := span.SpanContext().TraceID(); traceID.IsValid() {
+			inbound.TraceID = traceID.String()
+		}
+		inbound.TraceParent = telemetry.InjectTraceParent(ctx)
+	}
 	task, err := s.router.Resolve(ctx, inbound)
 	if err != nil {
 		switch {
@@ -60,6 +78,7 @@ func (s *Service) Accept(ctx context.Context, inbound message.InboundMessage) (c
 			return channels.AcceptResult{}, err
 		}
 	}
+	metricTenant = task.TenantID
 	if err := s.authorize(ctx, task); err != nil {
 		return channels.AcceptResult{RequestID: task.RequestID, TraceID: task.TraceID}, err
 	}
@@ -216,6 +235,9 @@ func (s *Service) deliver(ctx context.Context, delivery messaging.ReplyDelivery)
 		close(waiter)
 	}
 	if !delivery.Result.Target.Valid() || delivery.Result.Target.Channel == "demo" {
+		if delivery.Result.Target.Channel == "demo" {
+			telemetry.RecordOutbound(ctx, "demo", "acked")
+		}
 		_ = s.store.AckReply(ctx, delivery.StreamID)
 		return
 	}
@@ -242,6 +264,8 @@ func (s *Service) deliveryLoop(ctx context.Context, adapter channels.Adapter, de
 }
 
 func (s *Service) deliverOne(ctx context.Context, adapter channels.Adapter, delivery messaging.ReplyDelivery) {
+	ctx, span := telemetry.Start(telemetry.ExtractTraceParent(ctx, delivery.Result.TraceParent), "outbound.send")
+	defer span.End()
 	timeout := outboundSendTimeout(s.store.Config())
 	for ctx.Err() == nil {
 		state, err := s.store.BeginOutbound(ctx, delivery)
@@ -276,11 +300,13 @@ func (s *Service) deliverOne(ctx context.Context, adapter channels.Adapter, deli
 			err = s.store.CompleteOutbound(transitionCtx, delivery)
 			transitionCancel()
 			if err == nil {
+				telemetry.RecordOutbound(ctx, delivery.Result.Target.Channel, "succeeded")
 				return
 			}
 			continue
 		}
 		terminal, retryErr := s.store.RetryOutbound(transitionCtx, delivery, state, "send_failed")
+		telemetry.RecordOutbound(ctx, delivery.Result.Target.Channel, "send_failed")
 		transitionCancel()
 		if retryErr == nil && terminal {
 			return

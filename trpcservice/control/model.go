@@ -323,6 +323,8 @@ func allowedMetricLabel(name string) bool {
 	switch name {
 	case "tenant_id", "agent_app_id", "channel", "backend_kind", "node_id", "tool_name", "error_type":
 		return true
+	case "status", "operation", "token_type", "reason":
+		return true
 	default:
 		return false
 	}

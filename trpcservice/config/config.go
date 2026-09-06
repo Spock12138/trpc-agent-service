@@ -74,6 +74,7 @@ type Config struct {
 	CatalogPath    string
 	Messaging      *MessagingConfig
 	ControlPlane   *ControlPlaneConfig
+	Observability  ObservabilityConfig
 
 	ModelName           string
 	ModelBaseURL        string
@@ -218,7 +219,7 @@ func LoadForRole(role Role) (Config, error) {
 	}
 
 	if path := strings.TrimSpace(os.Getenv("PLATFORM_CONFIG_FILE")); path != "" {
-		catalog, rawMessaging, rawControlPlane, err := loadPlatformFile(path)
+		catalog, rawMessaging, rawControlPlane, rawObservability, err := loadPlatformFile(path)
 		if err != nil {
 			return Config{}, err
 		}
@@ -247,6 +248,11 @@ func LoadForRole(role Role) (Config, error) {
 			return Config{}, err
 		}
 		config.ControlPlane = controlPlane
+		observability, err := parseObservabilityFile(rawObservability)
+		if err != nil {
+			return Config{}, err
+		}
+		config.Observability = observability
 		config.CatalogPath = path
 		return config, nil
 	}
@@ -332,6 +338,11 @@ func loadLegacy(identitySecret []byte, role Role) (Config, error) {
 			return Config{}, err
 		}
 	}
+	observability, err := parseObservabilityFile(nil)
+	if err != nil {
+		return Config{}, err
+	}
+	config.Observability = observability
 	return config, nil
 }
 
@@ -381,14 +392,15 @@ func legacyCatalog(c Config) (tenant.Catalog, CredentialResolver, error) {
 }
 
 type catalogFile struct {
-	SchemaVersion   int                     `json:"schema_version"`
-	Messaging       *messagingConfigFile    `json:"messaging,omitempty"`
-	ControlPlane    *controlPlaneConfigFile `json:"control_plane,omitempty"`
-	Tenants         []tenant.Tenant         `json:"tenants"`
-	StorageProfiles []tenant.StorageProfile `json:"storage_profiles"`
-	AgentApps       []tenant.AgentApp       `json:"agent_apps"`
-	ConfigVersions  []configVersionFile     `json:"config_versions"`
-	ChannelBindings []tenant.ChannelBinding `json:"channel_bindings"`
+	SchemaVersion   int                      `json:"schema_version"`
+	Messaging       *messagingConfigFile     `json:"messaging,omitempty"`
+	ControlPlane    *controlPlaneConfigFile  `json:"control_plane,omitempty"`
+	Observability   *observabilityConfigFile `json:"observability,omitempty"`
+	Tenants         []tenant.Tenant          `json:"tenants"`
+	StorageProfiles []tenant.StorageProfile  `json:"storage_profiles"`
+	AgentApps       []tenant.AgentApp        `json:"agent_apps"`
+	ConfigVersions  []configVersionFile      `json:"config_versions"`
+	ChannelBindings []tenant.ChannelBinding  `json:"channel_bindings"`
 }
 
 type configVersionFile struct {
@@ -409,35 +421,35 @@ type modelConfigFile struct {
 }
 
 func loadCatalogFile(path string) (tenant.Catalog, error) {
-	catalog, _, _, err := loadPlatformFile(path)
+	catalog, _, _, _, err := loadPlatformFile(path)
 	return catalog, err
 }
 
-func loadPlatformFile(path string) (tenant.Catalog, *messagingConfigFile, *controlPlaneConfigFile, error) {
+func loadPlatformFile(path string) (tenant.Catalog, *messagingConfigFile, *controlPlaneConfigFile, *observabilityConfigFile, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return tenant.Catalog{}, nil, nil, fmt.Errorf("open platform config: %w", err)
+		return tenant.Catalog{}, nil, nil, nil, fmt.Errorf("open platform config: %w", err)
 	}
 	defer file.Close()
 	data, err := io.ReadAll(io.LimitReader(file, MaxCatalogBytes+1))
 	if err != nil {
-		return tenant.Catalog{}, nil, nil, fmt.Errorf("read platform config: %w", err)
+		return tenant.Catalog{}, nil, nil, nil, fmt.Errorf("read platform config: %w", err)
 	}
 	if len(data) > MaxCatalogBytes {
-		return tenant.Catalog{}, nil, nil, fmt.Errorf("platform config exceeds %d bytes", MaxCatalogBytes)
+		return tenant.Catalog{}, nil, nil, nil, fmt.Errorf("platform config exceeds %d bytes", MaxCatalogBytes)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var raw catalogFile
 	if err := decoder.Decode(&raw); err != nil {
-		return tenant.Catalog{}, nil, nil, fmt.Errorf("decode platform config: %w", err)
+		return tenant.Catalog{}, nil, nil, nil, fmt.Errorf("decode platform config: %w", err)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
-		return tenant.Catalog{}, nil, nil, errors.New("platform config must contain one JSON object")
+		return tenant.Catalog{}, nil, nil, nil, errors.New("platform config must contain one JSON object")
 	}
 	if raw.SchemaVersion != CatalogSchemaVersion {
-		return tenant.Catalog{}, nil, nil, errors.New("unsupported platform config schema_version")
+		return tenant.Catalog{}, nil, nil, nil, errors.New("unsupported platform config schema_version")
 	}
 
 	catalog := tenant.Catalog{
@@ -450,10 +462,10 @@ func loadPlatformFile(path string) (tenant.Catalog, *messagingConfigFile, *contr
 	for _, current := range raw.ConfigVersions {
 		timeout, err := time.ParseDuration(strings.TrimSpace(current.Model.RequestTimeout))
 		if err != nil {
-			return tenant.Catalog{}, nil, nil, errors.New("platform config contains an invalid model request_timeout")
+			return tenant.Catalog{}, nil, nil, nil, errors.New("platform config contains an invalid model request_timeout")
 		}
 		if _, err := envNameFromCredentialRef(current.Model.CredentialRef); err != nil {
-			return tenant.Catalog{}, nil, nil, err
+			return tenant.Catalog{}, nil, nil, nil, err
 		}
 		catalog.ConfigVersions = append(catalog.ConfigVersions, tenant.ConfigVersion{
 			TenantID: current.TenantID, AgentAppID: current.AgentAppID, Version: current.Version,
@@ -468,7 +480,7 @@ func loadPlatformFile(path string) (tenant.Catalog, *messagingConfigFile, *contr
 	for _, profile := range catalog.StorageProfiles {
 		if profile.Kind == tenant.StorageKindRedis || profile.Kind == tenant.StorageKindPostgres || profile.Kind == tenant.StorageKindMySQL {
 			if _, err := envNameFromCredentialRef(profile.CredentialRef); err != nil {
-				return tenant.Catalog{}, nil, nil, err
+				return tenant.Catalog{}, nil, nil, nil, err
 			}
 		}
 	}
@@ -478,11 +490,11 @@ func loadPlatformFile(path string) (tenant.Catalog, *messagingConfigFile, *contr
 				continue
 			}
 			if _, err := envNameFromCredentialRef(ref); err != nil {
-				return tenant.Catalog{}, nil, nil, err
+				return tenant.Catalog{}, nil, nil, nil, err
 			}
 		}
 	}
-	return catalog, raw.Messaging, raw.ControlPlane, nil
+	return catalog, raw.Messaging, raw.ControlPlane, raw.Observability, nil
 }
 
 func validateCatalogCredentials(catalog tenant.Catalog, resolver CredentialResolver) error {

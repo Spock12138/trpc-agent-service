@@ -11,6 +11,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/identity"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
@@ -61,6 +62,8 @@ func (r *Router) Resolve(ctx context.Context, inbound message.InboundMessage) (m
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, span := telemetry.Start(ctx, "gateway.resolve")
+	defer span.End()
 	channel := inbound.Channel
 	if channel == "" {
 		channel = "demo"

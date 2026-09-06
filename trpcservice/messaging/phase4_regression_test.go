@@ -35,6 +35,9 @@ func TestStrongCompleteTurnPersistsMultipleRounds(t *testing.T) {
 
 	completeRound := func(task message.ExecutionTask, worker string, state session.StateMap, eventID string) (*session.Session, string) {
 		t.Helper()
+		task.TraceParent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+		task.DigestVersion = 2
+		task.PayloadDigest = task.CanonicalDigest()
 		if _, _, err := store.Submit(ctx, task); err != nil {
 			t.Fatal(err)
 		}
@@ -49,6 +52,13 @@ func TestStrongCompleteTurnPersistsMultipleRounds(t *testing.T) {
 		commit := prepareTestTurn(t, svc, lease, task, state, eventID)
 		if err := store.CompleteTurn(ctx, lease, testReply(task), commit); err != nil {
 			t.Fatal(err)
+		}
+		replyDelivery, err := store.ReadReply(ctx, "gateway-trace", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if replyDelivery.Result.TraceParent != task.TraceParent || replyDelivery.Result.DigestVersion != task.DigestVersion {
+			t.Fatalf("reply trace metadata=(%q,%d), want (%q,%d)", replyDelivery.Result.TraceParent, replyDelivery.Result.DigestVersion, task.TraceParent, task.DigestVersion)
 		}
 		read, err := svc.GetSession(ctx, key)
 		if err != nil || read == nil {

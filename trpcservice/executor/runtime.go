@@ -29,6 +29,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/routing"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	frameworktool "trpc.group/trpc-go/trpc-agent-go/tool"
@@ -312,6 +313,8 @@ func (r *Runtime) PersistenceRoute(ctx context.Context, task platformmessage.Exe
 
 // Persist commits an already staged SQL turn without invoking the Agent.
 func (r *Runtime) Persist(ctx context.Context, envelope persistence.Envelope) error {
+	ctx, span := telemetry.Start(ctx, "persistence.persist")
+	defer span.End()
 	r.lifecycle.RLock()
 	defer r.lifecycle.RUnlock()
 	if err := envelope.Validate(); err != nil {
@@ -339,6 +342,8 @@ func (r *Runtime) Persist(ctx context.Context, envelope persistence.Envelope) er
 }
 
 func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
+	ctx, span := telemetry.Start(ctx, "runner.execute")
+	defer span.End()
 	router := r.router
 	if router == nil {
 		var err error
@@ -364,6 +369,8 @@ func (r *Runtime) Handle(ctx context.Context, req Request) (Reply, error) {
 // Execute runs an immutable task created by the trusted Router. It validates
 // the binding and exact config version again before acquiring a Runner.
 func (r *Runtime) Execute(ctx context.Context, task platformmessage.ExecutionTask) (Reply, error) {
+	ctx, span := telemetry.Start(ctx, "runner.execute")
+	defer span.End()
 	// Runtime.Close takes the write lock, so active Runner and backend work is
 	// drained before the registry and borrowed services are closed.
 	r.lifecycle.RLock()
@@ -407,6 +414,7 @@ func (r *Runtime) Execute(ctx context.Context, task platformmessage.ExecutionTas
 	defer cancel()
 	requestCtx = governance.WithPolicy(requestCtx, policySnapshot)
 	requestCtx = governance.WithTaskAudit(requestCtx, r.auditSink, task, r.identitySecret)
+	requestCtx, capturedGovernanceError := governance.WithExecutionErrorCapture(requestCtx)
 	if r.confirmations != nil {
 		requestCtx = governance.WithConfirmationManager(requestCtx, r.confirmations, governance.ActorHash(r.identitySecret, task.ActorUserID), task.SessionID)
 	}
@@ -436,15 +444,24 @@ func (r *Runtime) Execute(ctx context.Context, task platformmessage.ExecutionTas
 	}
 	defer lease.Release()
 
+	modelStarted := time.Now()
+	storageCtx, sessionSpan := telemetry.Start(requestCtx, "session.read")
+	storageCtx, memorySpan := telemetry.Start(storageCtx, "memory.read")
 	events, err := lease.Runner.Run(
-		requestCtx,
+		storageCtx,
 		task.RunnerUserID,
 		task.SessionID,
 		model.Message{Role: model.RoleUser, Content: task.Text},
 		frameworkagent.WithRequestID(task.RequestID),
 	)
 	if err != nil {
-		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+		memorySpan.End()
+		sessionSpan.End()
+		telemetry.RecordModel(requestCtx, time.Since(modelStarted).Seconds())
+		if captured := capturedGovernanceError(); captured != nil {
+			return Reply{}, captured
+		}
+		if contextDeadlineExceeded(requestCtx) {
 			return Reply{}, ErrAgentTimeout
 		}
 		if requestCtx.Err() == nil {
@@ -454,9 +471,19 @@ func (r *Runtime) Execute(ctx context.Context, task platformmessage.ExecutionTas
 		}
 		return Reply{}, ErrAgentFailed
 	}
-	text, eventErr := collectText(events)
+	text, eventErr := collectText(requestCtx, events)
+	memorySpan.End()
+	sessionSpan.End()
+	telemetry.RecordModel(requestCtx, time.Since(modelStarted).Seconds())
+	_, sessionWriteSpan := telemetry.Start(requestCtx, "session.write")
+	sessionWriteSpan.End()
+	_, memoryWriteSpan := telemetry.Start(requestCtx, "memory.write")
+	memoryWriteSpan.End()
+	if captured := capturedGovernanceError(); captured != nil {
+		return Reply{}, captured
+	}
 	if eventErr != nil {
-		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+		if contextDeadlineExceeded(requestCtx) {
 			return Reply{}, ErrAgentTimeout
 		}
 		if requestCtx.Err() == nil {
@@ -476,6 +503,8 @@ func (r *Runtime) Execute(ctx context.Context, task platformmessage.ExecutionTas
 // namespace. Runner writes are staged locally and committed only after the
 // runner has returned successfully.
 func (r *Runtime) ExecuteFenced(ctx context.Context, task platformmessage.ExecutionTask, fence sessionfence.Fence) (Reply, sessionfence.TurnCommit, error) {
+	ctx, span := telemetry.Start(ctx, "runner.execute")
+	defer span.End()
 	r.lifecycle.RLock()
 	defer r.lifecycle.RUnlock()
 	if ctx == nil {
@@ -550,13 +579,23 @@ func (r *Runtime) ExecuteFenced(ctx context.Context, task platformmessage.Execut
 	runCtx := sessionfence.WithTurn(requestCtx, turn)
 	runCtx = governance.WithPolicy(runCtx, policySnapshot)
 	runCtx = governance.WithTaskAudit(runCtx, r.auditSink, task, r.identitySecret)
+	runCtx, capturedGovernanceError := governance.WithExecutionErrorCapture(runCtx)
 	if r.confirmations != nil {
 		runCtx = governance.WithConfirmationManager(runCtx, r.confirmations, governance.ActorHash(r.identitySecret, task.ActorUserID), task.SessionID)
 	}
-	events, err := lease.Runner.Run(runCtx, task.RunnerUserID, task.SessionID, model.Message{Role: model.RoleUser, Content: task.Text}, frameworkagent.WithRequestID(task.RequestID))
+	modelStarted := time.Now()
+	storageCtx, sessionSpan := telemetry.Start(runCtx, "session.read")
+	storageCtx, memorySpan := telemetry.Start(storageCtx, "memory.read")
+	events, err := lease.Runner.Run(storageCtx, task.RunnerUserID, task.SessionID, model.Message{Role: model.RoleUser, Content: task.Text}, frameworkagent.WithRequestID(task.RequestID))
 	if err != nil {
+		memorySpan.End()
+		sessionSpan.End()
+		telemetry.RecordModel(runCtx, time.Since(modelStarted).Seconds())
 		svc.Discard(turn)
-		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+		if captured := capturedGovernanceError(); captured != nil {
+			return Reply{}, sessionfence.TurnCommit{}, captured
+		}
+		if contextDeadlineExceeded(requestCtx) {
 			return Reply{}, sessionfence.TurnCommit{}, ErrAgentTimeout
 		}
 		if errors.Is(err, persistence.ErrPostgresSummaryDisabled) {
@@ -564,14 +603,24 @@ func (r *Runtime) ExecuteFenced(ctx context.Context, task platformmessage.Execut
 		}
 		return Reply{}, sessionfence.TurnCommit{}, ErrAgentFailed
 	}
-	text, err := collectText(events)
+	text, err := collectText(runCtx, events)
+	memorySpan.End()
+	sessionSpan.End()
+	telemetry.RecordModel(runCtx, time.Since(modelStarted).Seconds())
+	_, sessionWriteSpan := telemetry.Start(runCtx, "session.write")
+	sessionWriteSpan.End()
+	_, memoryWriteSpan := telemetry.Start(runCtx, "memory.write")
+	memoryWriteSpan.End()
+	if captured := capturedGovernanceError(); captured != nil {
+		err = captured
+	}
 	if svcTurnTooLarge(turn) {
 		svc.Discard(turn)
 		return Reply{}, sessionfence.TurnCommit{}, ErrTurnTooLarge
 	}
 	if err != nil {
 		svc.Discard(turn)
-		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+		if contextDeadlineExceeded(requestCtx) {
 			return Reply{}, sessionfence.TurnCommit{}, ErrAgentTimeout
 		}
 		return Reply{}, sessionfence.TurnCommit{}, err
@@ -590,7 +639,7 @@ func svcTurnTooLarge(turn *sessionfence.Turn) bool {
 	return turn != nil && turn.IsOverLimit()
 }
 
-func collectText(events <-chan *event.Event) (string, error) {
+func collectText(ctx context.Context, events <-chan *event.Event) (string, error) {
 	var builder strings.Builder
 	var eventErr error
 	for current := range events {
@@ -603,6 +652,9 @@ func collectText(events <-chan *event.Event) (string, error) {
 		}
 		if current.Response == nil || current.IsToolCallResponse() || current.IsToolResultResponse() {
 			continue
+		}
+		if current.Response.Usage != nil {
+			telemetry.RecordTokens(ctx, current.Response.Usage.PromptTokens, current.Response.Usage.CompletionTokens, current.Response.Usage.TotalTokens)
 		}
 		for _, choice := range current.Response.Choices {
 			part := choice.Message.Content
@@ -620,6 +672,17 @@ func collectText(events <-chan *event.Event) (string, error) {
 		return "", ErrEmptyAgentResponse
 	}
 	return text, nil
+}
+
+func contextDeadlineExceeded(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return true
+	}
+	deadline, ok := ctx.Deadline()
+	return ok && !time.Now().Before(deadline)
 }
 
 func (r *Runtime) Close() error {

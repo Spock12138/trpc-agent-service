@@ -19,6 +19,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/persistence"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/sessionfence"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 type Executor interface {
@@ -151,6 +152,9 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
+	ctx, span := telemetry.Start(telemetry.ExtractTraceParent(runCtx, delivery.Task.TraceParent), "worker.claim")
+	defer span.End()
+	runCtx = ctx
 	w.mu.Lock()
 	activeDone := make(chan struct{})
 	w.activeDone = activeDone
@@ -260,6 +264,11 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 			persistenceErr = persistentExecutor.Persist(persistCtx, envelope)
 			persistCancel()
 		}
+		status := "succeeded"
+		if persistenceErr != nil {
+			status = "error"
+		}
+		telemetry.RecordPersistence(execCtx, string(route.Fingerprint.Kind), status)
 	}
 	cancel()
 	heartbeatFailed := false
@@ -279,7 +288,7 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 	if runCtx.Err() != nil && w.store.Config().ShutdownTimeout > 0 {
 		transitionTimeout = w.store.Config().ShutdownTimeout
 	}
-	transitionCtx, transitionCancel := context.WithTimeout(context.Background(), transitionTimeout)
+	transitionCtx, transitionCancel := context.WithTimeout(context.WithoutCancel(runCtx), transitionTimeout)
 	defer transitionCancel()
 	if executeErr == nil && w.store.Config().SessionFencing == "strong" && route.IsSQL() {
 		if turnCommit.SessionCoord == "" {
@@ -309,9 +318,12 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 				_ = w.store.Fail(transitionCtx, lease, "session_commit_invalid")
 				return
 			}
-			if err := w.store.CompleteTurn(transitionCtx, lease, reply, turnCommit); err != nil {
+			finalizeCtx, finalizeSpan := telemetry.Start(transitionCtx, "redis.finalize")
+			if err := w.store.CompleteTurn(finalizeCtx, lease, reply, turnCommit); err != nil {
+				finalizeSpan.End()
 				return
 			}
+			finalizeSpan.End()
 			return
 		}
 		_ = w.store.Complete(transitionCtx, lease, reply)
@@ -344,6 +356,11 @@ func (w *Worker) processPersistenceDelivery(runCtx context.Context, delivery mes
 	persistCtx, persistCancel := context.WithTimeout(execCtx, w.store.Config().PersistenceTimeout)
 	persistErr := persistentExecutor.Persist(persistCtx, envelope)
 	persistCancel()
+	persistenceStatus := "succeeded"
+	if persistErr != nil {
+		persistenceStatus = "error"
+	}
+	telemetry.RecordPersistence(execCtx, string(envelope.BackendKind), persistenceStatus)
 	cancel()
 	heartbeatFailed := false
 	for i := 0; i < 2; i++ {
@@ -355,7 +372,7 @@ func (w *Worker) processPersistenceDelivery(runCtx context.Context, delivery mes
 	if heartbeatFailed {
 		return
 	}
-	transitionCtx, transitionCancel := context.WithTimeout(context.Background(), w.store.Config().PersistenceTimeout)
+	transitionCtx, transitionCancel := context.WithTimeout(context.WithoutCancel(runCtx), w.store.Config().PersistenceTimeout)
 	defer transitionCancel()
 	if persistErr == nil {
 		_ = w.store.FinalizePersistence(transitionCtx, lease, envelope)
@@ -404,10 +421,12 @@ func (w *Worker) taskHeartbeat(ctx context.Context, cancel context.CancelFunc, l
 			return
 		case <-ticker.C:
 			if err := w.store.Heartbeat(ctx, lease); err != nil {
+				telemetry.RecordHeartbeat(ctx, "task", "error")
 				cancel()
 				done <- err
 				return
 			}
+			telemetry.RecordHeartbeat(ctx, "task", "succeeded")
 		}
 	}
 }
@@ -422,10 +441,12 @@ func (w *Worker) sessionHeartbeat(ctx context.Context, cancel context.CancelFunc
 			return
 		case <-ticker.C:
 			if err := w.store.SessionHeartbeat(ctx, lease); err != nil {
+				telemetry.RecordHeartbeat(ctx, "session", "error")
 				cancel()
 				done <- err
 				return
 			}
+			telemetry.RecordHeartbeat(ctx, "session", "succeeded")
 		}
 	}
 }
@@ -459,6 +480,10 @@ func classify(err error) (string, bool) {
 		return "tenant_policy_missing", false
 	case errors.Is(err, governance.ErrPolicyUnavailable):
 		return "tenant_policy_unavailable", false
+	case errors.Is(err, governance.ErrToolForbidden):
+		return "tool_rejected", false
+	case errors.Is(err, governance.ErrDangerousConfirmation):
+		return "confirmation_required", false
 	case errors.Is(err, control.ErrConfirmationNotFound), errors.Is(err, control.ErrConfirmationMismatch), errors.Is(err, governance.ErrInvalidConfirmationCmd):
 		return "confirmation_denied", false
 	case errors.Is(err, persistence.ErrFingerprintConflict):
