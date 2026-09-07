@@ -8,6 +8,7 @@ require (
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/go-telegram/bot v1.25.0
 	github.com/jackc/pgx/v5 v5.7.2
+	github.com/larksuite/oapi-sdk-go/v3 v3.11.0
 	github.com/openai/openai-go v1.12.0
 	github.com/redis/go-redis/v9 v9.11.0
 	go.opentelemetry.io/otel v1.29.0
@@ -39,7 +40,9 @@ require (
 	github.com/go-ego/gse v1.0.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.22.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect

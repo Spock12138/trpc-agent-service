@@ -31,10 +31,11 @@ Telegram / WeCom / Web UI
 
 ## ChannelBinding 与凭据
 
-支持的通道固定为 `demo`、`telegram`、`wecom_aibot`：
+支持的通道为 `demo`、`telegram`、`wecom_aibot`、`feishu`：
 
 - Telegram 只允许 `credential_ref`，并通过 `getMe` 核对绑定的 `external_account_id`。
 - 企业微信必须提供 `bot_id_ref` 与 `bot_secret_ref`。
+- 飞书必须提供 `bot_id_ref` 与 `bot_secret_ref`，分别引用 App ID 和 App Secret。
 - demo 不允许任何 IM 凭据。
 
 生产 JSON 只接受 `env:<ENV_NAME>`。引用缺失或格式错误是配置错误；引用值暂时缺失时使用不可用 Adapter，进程保持存活且整体 `/readyz=503`。认证或网络中断同样 not ready，并由 Adapter 重试。启动时用凭据摘要比较已解析 Bot 身份，禁止两个启用绑定复用同一 Bot，摘要和原值都不记录日志。
@@ -46,6 +47,12 @@ Telegram / WeCom / Web UI
 ## 企业微信
 
 协议与依赖选择见 `docs/stage5-wecom-spike.md`。每个启用 binding 建立一条连接，认证、心跳、断开、踢下线、单聊/群聊和 `aibot_respond_msg(msgtype=stream, finish=true)` 均由本地 Fake WebSocket 固定向量覆盖。Adapter 等待企业微信使用相同 `req_id` 返回的顶层 `errcode=0` 后才确认出站；无需另行发送人为 ACK。
+
+## 飞书
+
+飞书使用官方 `github.com/larksuite/oapi-sdk-go/v3` SDK 建立长连接，不需要公网 Webhook。首版只处理 `im.message.receive_v1` 文本事件，忽略非用户发送者；出站调用回复原消息接口 `/open-apis/im/v1/messages/:message_id/reply`。只有 SDK 请求无错误且飞书业务响应 `code=0` 时才确认发送成功，非零业务码会进入现有可靠出站重试。
+
+开放平台必须启用机器人能力，事件接收方式选择“使用长连接接收事件”，订阅 `im.message.receive_v1`，并开通 `im:message:send_as_bot` 权限。单聊接收需要 `im:message.p2p_msg:readonly`，群聊 @ 机器人接收需要 `im:message.group_at_msg:readonly`。应用版本还需要发布生效，测试用户必须在应用可用范围内。建议先验收单聊；最终成功标准是飞书客户端实际显示模型回复。
 
 ## 可靠出站
 

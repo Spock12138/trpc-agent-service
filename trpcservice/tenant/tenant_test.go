@@ -83,6 +83,8 @@ func TestChannelBindingCredentialContracts(t *testing.T) {
 		{name: "telegram with wecom reference", binding: ChannelBinding{Channel: "telegram", CredentialRef: "env:TOKEN", BotIDRef: "env:BOT_ID"}},
 		{name: "wecom missing secret", binding: ChannelBinding{Channel: "wecom_aibot", BotIDRef: "env:BOT_ID"}},
 		{name: "wecom with telegram token", binding: ChannelBinding{Channel: "wecom_aibot", CredentialRef: "env:TOKEN", BotIDRef: "env:BOT_ID", BotSecretRef: "env:BOT_SECRET"}},
+		{name: "feishu missing secret", binding: ChannelBinding{Channel: "feishu", BotIDRef: "env:APP_ID"}},
+		{name: "feishu with generic token", binding: ChannelBinding{Channel: "feishu", CredentialRef: "env:TOKEN", BotIDRef: "env:APP_ID", BotSecretRef: "env:APP_SECRET"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -97,6 +99,16 @@ func TestChannelBindingCredentialContracts(t *testing.T) {
 				t.Fatal("invalid channel credential contract was accepted")
 			}
 		})
+	}
+
+	validFeishu := testCatalog()
+	validFeishu.ChannelBindings[0] = ChannelBinding{
+		ID: "feishu-a", Channel: "feishu", ExternalAccountID: "cli_app",
+		BotIDRef: "env:APP_ID", BotSecretRef: "env:APP_SECRET",
+		TenantID: "tenant-a", AgentAppID: "assistant", Enabled: true,
+	}
+	if _, err := NewPresetRepository(validFeishu); err != nil {
+		t.Fatalf("valid Feishu binding was rejected: %v", err)
 	}
 
 	catalog := testCatalog()

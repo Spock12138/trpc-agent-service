@@ -18,7 +18,7 @@ func TestPhase7ExampleConfigsLoad(t *testing.T) {
 	t.Setenv("PHASE7_POSTGRES_DSN", "postgres://phase7:phase7@postgres:5432/phase7?sslmode=disable")
 	t.Setenv("PHASE7_MYSQL_DSN", "phase7:phase7@tcp(mysql:3306)/phase7?parseTime=true&charset=utf8mb4&loc=UTC")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-	for _, name := range []string{"phase7.full.example.json", "phase7.light.example.json", "phase7.real-model.example.json", "phase7.real-wecom.example.json"} {
+	for _, name := range []string{"phase7.full.example.json", "phase7.light.example.json", "phase7.real-model.example.json", "phase7.real-wecom.example.json", "phase7.real-feishu.example.json"} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("PLATFORM_CONFIG_FILE", filepath.Join("..", "..", "configs", name))
 			cfg, err := LoadForRole(RoleServe)

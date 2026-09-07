@@ -459,6 +459,16 @@ func newAdapters(cfg config.Config) ([]channels.Adapter, error) {
 			if botErr != nil || secretErr != nil {
 				adapter = &channels.UnavailableAdapter{BindingID: binding.ID}
 			}
+		case "feishu":
+			appID, appErr := resolver.Resolve(binding.BotIDRef)
+			secret, secretErr := resolver.Resolve(binding.BotSecretRef)
+			if appErr == nil && secretErr == nil {
+				identityValue = appID
+				adapter, err = channels.NewFeishuAdapter(binding.ID, binding.ExternalAccountID, appID, secret)
+			}
+			if appErr != nil || secretErr != nil {
+				adapter = &channels.UnavailableAdapter{BindingID: binding.ID}
+			}
 		}
 		if err != nil {
 			return nil, err

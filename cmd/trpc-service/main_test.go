@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
@@ -64,6 +65,54 @@ func TestNewAdaptersRejectsDuplicateResolvedBot(t *testing.T) {
 	}, map[string]string{"env:MODEL": "model-key", "env:TELEGRAM_A": "same-token", "env:TELEGRAM_B": "same-token"})
 	if _, err := newAdapters(cfg); err == nil {
 		t.Fatal("duplicate resolved Telegram bot was accepted")
+	}
+}
+
+func TestNewAdaptersCreatesFeishuAdapter(t *testing.T) {
+	cfg := adapterTestConfig(t, []tenant.ChannelBinding{{
+		ID: "feishu-a", Channel: "feishu", ExternalAccountID: "cli_app",
+		BotIDRef: "env:FEISHU_APP_ID", BotSecretRef: "env:FEISHU_APP_SECRET",
+		TenantID: "tenant-a", AgentAppID: "assistant", Enabled: true,
+	}}, map[string]string{
+		"env:MODEL":             "model-key",
+		"env:FEISHU_APP_ID":     "cli_app",
+		"env:FEISHU_APP_SECRET": "app-secret",
+	})
+	adapters, err := newAdapters(cfg)
+	if err != nil || len(adapters) != 1 {
+		t.Fatalf("newAdapters() = (%#v, %v)", adapters, err)
+	}
+	if _, ok := adapters[0].(*channels.FeishuAdapter); !ok {
+		t.Fatalf("adapter type = %T, want *channels.FeishuAdapter", adapters[0])
+	}
+}
+
+func TestNewAdaptersKeepsMissingFeishuCredentialNotReady(t *testing.T) {
+	cfg := adapterTestConfig(t, []tenant.ChannelBinding{{
+		ID: "feishu-a", Channel: "feishu", ExternalAccountID: "cli_app",
+		BotIDRef: "env:FEISHU_APP_ID", BotSecretRef: "env:FEISHU_APP_SECRET",
+		TenantID: "tenant-a", AgentAppID: "assistant", Enabled: true,
+	}}, map[string]string{"env:MODEL": "model-key", "env:FEISHU_APP_ID": "cli_app"})
+	adapters, err := newAdapters(cfg)
+	if err != nil || len(adapters) != 1 {
+		t.Fatalf("newAdapters() = (%#v, %v)", adapters, err)
+	}
+	if _, ok := adapters[0].(*channels.UnavailableAdapter); !ok {
+		t.Fatalf("adapter type = %T, want *channels.UnavailableAdapter", adapters[0])
+	}
+}
+
+func TestNewAdaptersRejectsDuplicateResolvedFeishuApp(t *testing.T) {
+	bindings := []tenant.ChannelBinding{
+		{ID: "feishu-a", Channel: "feishu", ExternalAccountID: "account-a", BotIDRef: "env:FEISHU_A", BotSecretRef: "env:FEISHU_SECRET_A", TenantID: "tenant-a", AgentAppID: "assistant", Enabled: true},
+		{ID: "feishu-b", Channel: "feishu", ExternalAccountID: "account-b", BotIDRef: "env:FEISHU_B", BotSecretRef: "env:FEISHU_SECRET_B", TenantID: "tenant-a", AgentAppID: "assistant", Enabled: true},
+	}
+	credentials := map[string]string{
+		"env:MODEL": "model-key", "env:FEISHU_A": "cli_same", "env:FEISHU_B": "cli_same",
+		"env:FEISHU_SECRET_A": "secret-a", "env:FEISHU_SECRET_B": "secret-b",
+	}
+	if _, err := newAdapters(adapterTestConfig(t, bindings, credentials)); err == nil {
+		t.Fatal("duplicate resolved Feishu app was accepted")
 	}
 }
 

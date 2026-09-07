@@ -386,6 +386,10 @@ func validateChannelBinding(current ChannelBinding) error {
 		if current.CredentialRef != "" || strings.TrimSpace(current.BotIDRef) == "" || strings.TrimSpace(current.BotSecretRef) == "" {
 			return fmt.Errorf("wecom_aibot binding %q requires bot_id_ref and bot_secret_ref only", current.ID)
 		}
+	case "feishu":
+		if current.CredentialRef != "" || strings.TrimSpace(current.BotIDRef) == "" || strings.TrimSpace(current.BotSecretRef) == "" {
+			return fmt.Errorf("feishu binding %q requires bot_id_ref and bot_secret_ref only", current.ID)
+		}
 	default:
 		return fmt.Errorf("binding %q has unsupported channel %q", current.ID, current.Channel)
 	}
