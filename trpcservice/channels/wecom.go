@@ -2,6 +2,7 @@ package channels
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +43,9 @@ type WeComAdapter struct {
 	cancel  context.CancelFunc
 	writeMu sync.Mutex
 
+	responseMu sync.Mutex
+	responses  map[string]chan wecomEnvelope
+
 	heartbeatInterval time.Duration
 	readPollInterval  time.Duration
 	reconnectBackoff  time.Duration
@@ -58,6 +62,7 @@ func NewWeComAdapter(bindingID, accountID, botID, secret, endpoint string) (*WeC
 	}
 	return &WeComAdapter{
 		bindingID: bindingID, accountID: accountID, botID: botID, secret: secret, endpoint: endpoint,
+		responses:         make(map[string]chan wecomEnvelope),
 		heartbeatInterval: 30 * time.Second, readPollInterval: time.Second,
 		reconnectBackoff: time.Second, maxBackoff: 30 * time.Second, subscribeTimeout: 10 * time.Second,
 	}, nil
@@ -202,6 +207,8 @@ func (a *WeComAdapter) readLoop(ctx context.Context, sink IngressSink) error {
 				}
 			} else if incoming.Cmd == "aibot_event_callback" && isWeComDisconnected(incoming.Body) {
 				return errors.New("wecom disconnected event")
+			} else {
+				a.deliverResponse(incoming)
 			}
 			continue
 		}
@@ -263,11 +270,76 @@ func (a *WeComAdapter) Send(ctx context.Context, outbound message.OutboundMessag
 	if strings.TrimSpace(outbound.Text) == "" || outbound.ConversationID == "" || outbound.PlatformRequestID == "" {
 		return errors.New("wecom outbound target is incomplete")
 	}
-	body := map[string]any{"msgtype": "text", "text": map[string]string{"content": outbound.Text}, "finish": true}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	response, unregister, err := a.registerResponse(outbound.PlatformRequestID)
+	if err != nil {
+		return err
+	}
+	defer unregister()
+	body := map[string]any{
+		"msgtype": "stream",
+		"stream": map[string]any{
+			"id":      wecomStreamID(outbound.PlatformRequestID),
+			"finish":  true,
+			"content": outbound.Text,
+		},
+	}
 	if err := a.write(wecomEnvelope{Cmd: "aibot_respond_msg", Headers: wecomHeaders{ReqID: outbound.PlatformRequestID}, Body: mustJSON(body)}); err != nil {
 		return err
 	}
-	return nil
+	select {
+	case result := <-response:
+		if result.ErrCode == nil {
+			return errors.New("wecom response status is missing")
+		}
+		if *result.ErrCode != 0 {
+			return fmt.Errorf("wecom response rejected with errcode %d", *result.ErrCode)
+		}
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("wait for wecom response: %w", ctx.Err())
+	}
+}
+
+func (a *WeComAdapter) registerResponse(reqID string) (<-chan wecomEnvelope, func(), error) {
+	a.responseMu.Lock()
+	defer a.responseMu.Unlock()
+	if a.responses == nil {
+		a.responses = make(map[string]chan wecomEnvelope)
+	}
+	if _, exists := a.responses[reqID]; exists {
+		return nil, nil, errors.New("wecom response is already pending")
+	}
+	response := make(chan wecomEnvelope, 1)
+	a.responses[reqID] = response
+	return response, func() {
+		a.responseMu.Lock()
+		delete(a.responses, reqID)
+		a.responseMu.Unlock()
+	}, nil
+}
+
+func (a *WeComAdapter) deliverResponse(incoming wecomEnvelope) {
+	if incoming.Headers.ReqID == "" || incoming.ErrCode == nil {
+		return
+	}
+	a.responseMu.Lock()
+	response := a.responses[incoming.Headers.ReqID]
+	a.responseMu.Unlock()
+	if response == nil {
+		return
+	}
+	select {
+	case response <- incoming:
+	default:
+	}
+}
+
+func wecomStreamID(reqID string) string {
+	digest := sha256.Sum256([]byte(reqID))
+	return fmt.Sprintf("stream-%x", digest[:16])
 }
 
 func (a *WeComAdapter) write(envelope wecomEnvelope) error {

@@ -45,7 +45,7 @@ Telegram / WeCom / Web UI
 
 ## 企业微信
 
-协议与依赖选择见 `docs/stage5-wecom-spike.md`。每个启用 binding 建立一条连接，认证、心跳、断开、踢下线、单聊/群聊和 `aibot_respond_msg(finish=true)` 均由本地 Fake WebSocket 固定向量覆盖。没有额外人为 ACK。
+协议与依赖选择见 `docs/stage5-wecom-spike.md`。每个启用 binding 建立一条连接，认证、心跳、断开、踢下线、单聊/群聊和 `aibot_respond_msg(msgtype=stream, finish=true)` 均由本地 Fake WebSocket 固定向量覆盖。Adapter 等待企业微信使用相同 `req_id` 返回的顶层 `errcode=0` 后才确认出站；无需另行发送人为 ACK。
 
 ## 可靠出站
 

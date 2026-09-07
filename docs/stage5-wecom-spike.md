@@ -51,19 +51,24 @@ wss://openws.work.weixin.qq.com
 
 `single` 以 `from.userid` 作为会话主体，`group` 以 `chatid` 作为会话主体，并保留真实 `actor_user_id`。群聊 Adapter 使用官方回调提供的 `text.content`；本阶段不猜测或用字符串规则删除未在字段向量中声明的 mention。
 
-最终文本回复必须透传回调的 `headers.req_id`：
+最终文本回复必须透传回调的 `headers.req_id`。当前长连接协议使用
+`msgtype=stream` 表达文本；一次性回复生成稳定的 `stream.id` 并直接设置
+`finish=true`：
 
 ```json
 {
   "cmd": "aibot_respond_msg",
   "headers": {"req_id": "<callback req_id>"},
   "body": {
-    "msgtype": "text",
-    "text": {"content": "<final text>"},
-    "finish": true
+    "msgtype": "stream",
+    "stream": {"id": "<stable stream id>", "content": "<final text>", "finish": true}
   }
 }
 ```
+
+企业微信会返回同一 `headers.req_id` 的顶层 `errcode`。Adapter 只有收到
+`errcode=0` 才把出站标记为成功；写入 WebSocket 但被服务端拒绝或等待响应
+超时都进入现有 Outbound 重试。
 
 协议没有额外的业务 ACK 帧要求，也不发送人为设计的“收到啦”文本。可靠入队后由最终回复关联原 `req_id`。官方建议每 30 秒发送 `ping`。`aibot_event_callback` 仅在 `body.event.eventtype=disconnected_event` 时作为踢下线信号；客户端关闭旧连接并有界指数退避重连。
 

@@ -3,6 +3,7 @@ package channels
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
@@ -41,6 +42,10 @@ func TestWeComFakeServerContract(t *testing.T) {
 				return
 			}
 			outgoing <- current
+			if current.Cmd == "aibot_respond_msg" {
+				code := 0
+				_ = websocket.JSON.Send(conn, wecomEnvelope{Headers: current.Headers, ErrCode: &code, ErrMsg: "ok"})
+			}
 		}
 	}))
 	defer server.Close()
@@ -100,12 +105,13 @@ func TestWeComFakeServerContract(t *testing.T) {
 				}
 				var body struct {
 					MsgType string `json:"msgtype"`
-					Text    struct {
+					Stream  struct {
+						ID      string `json:"id"`
+						Finish  bool   `json:"finish"`
 						Content string `json:"content"`
-					} `json:"text"`
-					Finish bool `json:"finish"`
+					} `json:"stream"`
 				}
-				if err := json.Unmarshal(current.Body, &body); err != nil || body.MsgType != "text" || body.Text.Content != "answer" || !body.Finish {
+				if err := json.Unmarshal(current.Body, &body); err != nil || body.MsgType != "stream" || body.Stream.ID == "" || body.Stream.Content != "answer" || !body.Stream.Finish {
 					t.Fatalf("response body = %s, error=%v", current.Body, err)
 				}
 			}
@@ -229,6 +235,93 @@ func TestWeComReplyRequiresCallbackRequestID(t *testing.T) {
 	if err := adapter.Send(context.Background(), message.OutboundMessage{ConversationID: "chat-a", Text: "answer"}); err == nil {
 		t.Fatal("Send accepted a response without callback req_id")
 	}
+}
+
+func TestWeComReplyRejectsProviderError(t *testing.T) {
+	server := httptest.NewServer(websocket.Handler(func(conn *websocket.Conn) {
+		var subscribe wecomEnvelope
+		if websocket.JSON.Receive(conn, &subscribe) != nil {
+			return
+		}
+		code := 0
+		_ = websocket.JSON.Send(conn, wecomEnvelope{Headers: subscribe.Headers, ErrCode: &code, ErrMsg: "ok"})
+		var response wecomEnvelope
+		if websocket.JSON.Receive(conn, &response) != nil {
+			return
+		}
+		code = 40001
+		_ = websocket.JSON.Send(conn, wecomEnvelope{Headers: response.Headers, ErrCode: &code, ErrMsg: "rejected"})
+	}))
+	defer server.Close()
+
+	adapter, err := NewWeComAdapter("wecom-a", "bot-account", "bot-id", "bot-secret", strings.Replace(server.URL, "http://", "ws://", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.readPollInterval = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- adapter.Start(ctx, ingressSinkFunc(func(context.Context, message.InboundMessage) (AcceptResult, error) { return AcceptResult{}, nil }))
+	}()
+	waitForWeComReady(t, adapter)
+	if err := adapter.Send(context.Background(), message.OutboundMessage{ConversationID: "user-a", PlatformRequestID: "reply-rejected", Text: "answer"}); err == nil || !strings.Contains(err.Error(), "errcode 40001") {
+		t.Fatalf("Send() error = %v, want provider rejection", err)
+	}
+	cancel()
+	_ = adapter.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWeComReplyWaitsForProviderResponse(t *testing.T) {
+	server := httptest.NewServer(websocket.Handler(func(conn *websocket.Conn) {
+		var subscribe wecomEnvelope
+		if websocket.JSON.Receive(conn, &subscribe) != nil {
+			return
+		}
+		code := 0
+		_ = websocket.JSON.Send(conn, wecomEnvelope{Headers: subscribe.Headers, ErrCode: &code, ErrMsg: "ok"})
+		var response wecomEnvelope
+		_ = websocket.JSON.Receive(conn, &response)
+		time.Sleep(100 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	adapter, err := NewWeComAdapter("wecom-a", "bot-account", "bot-id", "bot-secret", strings.Replace(server.URL, "http://", "ws://", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.readPollInterval = 5 * time.Millisecond
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- adapter.Start(runCtx, ingressSinkFunc(func(context.Context, message.InboundMessage) (AcceptResult, error) { return AcceptResult{}, nil }))
+	}()
+	waitForWeComReady(t, adapter)
+	sendCtx, cancelSend := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelSend()
+	if err := adapter.Send(sendCtx, message.OutboundMessage{ConversationID: "user-a", PlatformRequestID: "reply-timeout", Text: "answer"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Send() error = %v, want deadline exceeded", err)
+	}
+	cancelRun()
+	_ = adapter.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForWeComReady(t *testing.T, adapter *WeComAdapter) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if adapter.Ready(context.Background()) == nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("WeCom adapter did not become ready")
 }
 
 func receiveWeComEnvelope(t *testing.T, source <-chan wecomEnvelope) wecomEnvelope {
