@@ -28,14 +28,24 @@
       "max_output_tokens": 1024
     }
   }],
-  "channel_bindings": [{
-    "id": "feishu-real",
-    "channel": "feishu",
-    "external_account_id": "feishu-real",
-    "bot_id_ref": "env:PHASE7_FEISHU_APP_ID",
-    "bot_secret_ref": "env:PHASE7_FEISHU_APP_SECRET",
-    "tenant_id": "tenant-feishu",
-    "agent_app_id": "assistant",
-    "enabled": true
-  }]
+  "channel_bindings": [
+    {
+      "id": "demo-binding",
+      "channel": "demo",
+      "external_account_id": "demo-binding",
+      "tenant_id": "tenant-feishu",
+      "agent_app_id": "assistant",
+      "enabled": true
+    },
+    {
+      "id": "feishu-real",
+      "channel": "feishu",
+      "external_account_id": "feishu-real",
+      "bot_id_ref": "env:PHASE7_FEISHU_APP_ID",
+      "bot_secret_ref": "env:PHASE7_FEISHU_APP_SECRET",
+      "tenant_id": "tenant-feishu",
+      "agent_app_id": "assistant",
+      "enabled": true
+    }
+  ]
 }
