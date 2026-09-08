@@ -299,7 +299,7 @@ func (s *Store) submit(ctx context.Context, task message.ExecutionTask, assignme
 	created := false
 	if s.config.SessionFencing == "strong" {
 		coord := sessionCoord(task)
-		args := []interface{}{task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID, coord, strconv.FormatInt(time.Now().UnixMilli(), 10)}
+		args := []interface{}{task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID, coord, strconv.FormatInt(time.Now().UnixMilli(), 10), task.RequestID}
 		if assignment != nil {
 			args = append(args, assignment.NodeID, assignment.Revision, string(assignment.Mode), string(assignment.State), assignment.PayloadDigest)
 		}
@@ -316,7 +316,7 @@ func (s *Store) submit(ctx context.Context, task message.ExecutionTask, assignme
 		}
 		created = len(result) > 0 && asInt64(result[0]) == 1
 	} else {
-		args := []interface{}{task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID}
+		args := []interface{}{task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID, task.RequestID}
 		if assignment != nil {
 			args = append(args, assignment.NodeID, assignment.Revision, string(assignment.Mode), string(assignment.State), assignment.PayloadDigest)
 		}

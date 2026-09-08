@@ -120,7 +120,7 @@ func TestSQLPersistenceRetryResumeAndFinalize(t *testing.T) {
 		t.Fatal(err)
 	}
 	final, err := store.Snapshot(context.Background(), task.InboxID())
-	if err != nil || final.State != StateSucceeded || final.RawEnvelope != "" || final.EnvelopeDigest != "" {
+	if err != nil || final.State != StateSucceeded || final.RequestID != task.RequestID || final.RawPayload != "" || final.RawEnvelope != "" || final.EnvelopeDigest != "" {
 		t.Fatalf("final snapshot = (%#v,%v)", final, err)
 	}
 	if ttl := server.TTL(resumedLease.InboxKey); ttl <= 0 {
