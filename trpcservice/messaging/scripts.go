@@ -28,12 +28,12 @@ redis.call('HSET', KEYS[4], 'updated_at_ms', ARGV[8])
 redis.call('HSET', KEYS[1],
   'task_id', ARGV[1], 'digest', ARGV[2], 'payload', ARGV[3],
   'state', 'queued', 'attempt', ARGV[4], 'trace_id', ARGV[5], 'inbox_id', ARGV[6],
-  'session_coord', ARGV[7], 'session_seq', seq, 'received_at_ms', ARGV[8])
+  'session_coord', ARGV[7], 'session_seq', seq, 'received_at_ms', ARGV[8], 'request_id', ARGV[9])
 local stream_id = redis.call('XADD', KEYS[2], '*', 'payload', ARGV[3], 'inbox_id', ARGV[6],
   'session_coord', ARGV[7], 'session_seq', seq)
 redis.call('HSET', KEYS[1], 'stream_id', stream_id)
-if ARGV[9] and ARGV[9] ~= '' then
-  redis.call('HSET', KEYS[1], 'node_id', ARGV[9], 'assignment_revision', ARGV[10], 'assignment_mode', ARGV[11], 'assignment_state', ARGV[12], 'assignment_payload_digest', ARGV[13])
+if ARGV[10] and ARGV[10] ~= '' then
+  redis.call('HSET', KEYS[1], 'node_id', ARGV[10], 'assignment_revision', ARGV[11], 'assignment_mode', ARGV[12], 'assignment_state', ARGV[13], 'assignment_payload_digest', ARGV[14])
 end
 return {1, seq, stream_id}
 `)
@@ -56,9 +56,9 @@ local payload_ok, payload = pcall(cjson.decode, ARGV[3])
 if not payload_ok or type(payload) ~= 'table' or payload['task_id'] ~= ARGV[1] or payload['payload_digest'] ~= ARGV[2] or tonumber(payload['attempt'] or '0') ~= tonumber(ARGV[4]) then return -2 end
 redis.call('HSET', KEYS[1],
   'task_id', ARGV[1], 'digest', ARGV[2], 'payload', ARGV[3],
-  'state', 'queued', 'attempt', ARGV[4], 'trace_id', ARGV[5], 'inbox_id', ARGV[6])
-if ARGV[7] and ARGV[7] ~= '' then
-  redis.call('HSET', KEYS[1], 'node_id', ARGV[7], 'assignment_revision', ARGV[8], 'assignment_mode', ARGV[9], 'assignment_state', ARGV[10], 'assignment_payload_digest', ARGV[11])
+  'state', 'queued', 'attempt', ARGV[4], 'trace_id', ARGV[5], 'inbox_id', ARGV[6], 'request_id', ARGV[7])
+if ARGV[8] and ARGV[8] ~= '' then
+  redis.call('HSET', KEYS[1], 'node_id', ARGV[8], 'assignment_revision', ARGV[9], 'assignment_mode', ARGV[10], 'assignment_state', ARGV[11], 'assignment_payload_digest', ARGV[12])
 end
 local stream_id = redis.call('XADD', KEYS[2], '*', 'payload', ARGV[3], 'inbox_id', ARGV[6])
 redis.call('HSET', KEYS[1], 'stream_id', stream_id)

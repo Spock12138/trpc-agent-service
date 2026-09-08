@@ -122,7 +122,7 @@ func TestLeaseHeartbeatCompleteAndReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot, err := store.Snapshot(context.Background(), task.InboxID())
-	if err != nil || snapshot.State != StateSucceeded || snapshot.Result == nil || snapshot.Result.Reply.Text != "ok" {
+	if err != nil || snapshot.State != StateSucceeded || snapshot.RequestID != task.RequestID || snapshot.RawPayload != "" || snapshot.Result == nil || snapshot.Result.Reply.Text != "ok" {
 		t.Fatalf("terminal snapshot = (%#v, %v)", snapshot, err)
 	}
 	replyDelivery, err := store.ReadReply(context.Background(), "gateway-a", time.Millisecond)
