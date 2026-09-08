@@ -28,14 +28,24 @@
       "max_output_tokens": 1024
     }
   }],
-  "channel_bindings": [{
-    "id": "wecom-real",
-    "channel": "wecom_aibot",
-    "external_account_id": "wecom-real",
-    "bot_id_ref": "env:PHASE7_WECOM_BOT_ID",
-    "bot_secret_ref": "env:PHASE7_WECOM_BOT_SECRET",
-    "tenant_id": "tenant-wecom",
-    "agent_app_id": "assistant",
-    "enabled": true
-  }]
+  "channel_bindings": [
+    {
+      "id": "demo-binding",
+      "channel": "demo",
+      "external_account_id": "demo-binding",
+      "tenant_id": "tenant-wecom",
+      "agent_app_id": "assistant",
+      "enabled": true
+    },
+    {
+      "id": "wecom-real",
+      "channel": "wecom_aibot",
+      "external_account_id": "wecom-real",
+      "bot_id_ref": "env:PHASE7_WECOM_BOT_ID",
+      "bot_secret_ref": "env:PHASE7_WECOM_BOT_SECRET",
+      "tenant_id": "tenant-wecom",
+      "agent_app_id": "assistant",
+      "enabled": true
+    }
+  ]
 }
