@@ -112,6 +112,17 @@ if redis.call('GET',KEYS[1])~=ARGV[1] then return 0 end
 redis.call('DEL',KEYS[1]); return 1
 `)
 
+var appendAuditScript = redis.NewScript(`
+local audit_type=redis.call('TYPE',KEYS[1]); local ids_type=redis.call('TYPE',KEYS[2])
+if type(audit_type)=='table' then audit_type=audit_type.ok end; if type(ids_type)=='table' then ids_type=ids_type.ok end
+if (audit_type~='none' and audit_type~='zset') or (ids_type~='none' and ids_type~='zset') then return -9 end
+redis.call('ZREMRANGEBYSCORE',KEYS[1],'-inf',ARGV[3]); redis.call('ZREMRANGEBYSCORE',KEYS[2],'-inf',ARGV[3])
+if tonumber(ARGV[1])<=tonumber(ARGV[3]) then return 0 end
+if redis.call('ZADD',KEYS[2],'NX',ARGV[1],ARGV[2])==0 then return 0 end
+redis.call('ZADD',KEYS[1],ARGV[1],ARGV[4])
+redis.call('PEXPIRE',KEYS[1],ARGV[5]); redis.call('PEXPIRE',KEYS[2],ARGV[5]); return 1
+`)
+
 type RedisRepository struct {
 	client *redis.Client
 	config config.ControlPlaneConfig
@@ -442,11 +453,35 @@ func (r *RedisRepository) PutAssignment(ctx context.Context, assignment NodeAssi
 	return assignment, nil
 }
 
+// AppendAudit retains the first valid record for an audit ID. Replays of that
+// ID within the retention window are successful no-ops and never overwrite
+// the original event.
 func (r *RedisRepository) AppendAudit(ctx context.Context, record AuditRecord) error {
 	if err := record.Validate(); err != nil {
 		return err
 	}
-	return r.appendTimed(ctx, r.auditKey(), record.OccurredAt, record, r.config.AuditRetention)
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	cutoff := time.Now().Add(-r.config.AuditRetention).UnixMilli()
+	result, err := appendAuditScript.Run(
+		ctx,
+		r.client,
+		[]string{r.auditKey(), r.auditIDsKey()},
+		record.OccurredAt.UnixMilli(),
+		record.ID,
+		cutoff,
+		string(raw),
+		r.config.AuditRetention.Milliseconds(),
+	).Int()
+	if err != nil {
+		return fmt.Errorf("%w: append retained audit event", ErrUnavailable)
+	}
+	if result == -9 {
+		return fmt.Errorf("%w: incompatible audit index", ErrUnavailable)
+	}
+	return nil
 }
 
 func (r *RedisRepository) QueryAudit(ctx context.Context, query AuditQuery) ([]AuditRecord, string, error) {
@@ -801,6 +836,7 @@ func (r *RedisRepository) assignmentKey(inboxID string) string {
 	return r.prefix + ":assignment:" + inboxID
 }
 func (r *RedisRepository) auditKey() string    { return r.prefix + ":audit" }
+func (r *RedisRepository) auditIDsKey() string { return r.prefix + ":audit-ids" }
 func (r *RedisRepository) metricKey() string   { return r.prefix + ":metrics" }
 func (r *RedisRepository) degradedKey() string { return r.prefix + ":degraded" }
 func (r *RedisRepository) confirmationKey(nonce string) string {

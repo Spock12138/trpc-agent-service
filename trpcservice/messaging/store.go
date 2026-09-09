@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,6 +75,12 @@ type Snapshot struct {
 	TraceParent             string
 	DigestVersion           int
 	RequestID               string
+	TenantID                string
+	AgentAppID              string
+	Channel                 string
+	BindingID               string
+	PlatformMessageID       string
+	ReceivedAt              time.Time
 	ErrorCode               string
 	Result                  *message.TaskResult
 	RawPayload              string
@@ -95,6 +102,17 @@ type Snapshot struct {
 
 func (s Snapshot) Terminal() bool {
 	return s.State == StateSucceeded || s.State == StateFailedTerminal
+}
+
+func (s Snapshot) StoredTask() (message.ExecutionTask, error) {
+	if s.RawPayload == "" {
+		return message.ExecutionTask{}, ErrInboxMissing
+	}
+	var task message.ExecutionTask
+	if err := decodeStrictJSON(s.RawPayload, &task); err != nil {
+		return message.ExecutionTask{}, err
+	}
+	return task, nil
 }
 
 type Delivery struct {
@@ -299,7 +317,7 @@ func (s *Store) submit(ctx context.Context, task message.ExecutionTask, assignme
 	created := false
 	if s.config.SessionFencing == "strong" {
 		coord := sessionCoord(task)
-		args := []interface{}{task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID, coord, strconv.FormatInt(time.Now().UnixMilli(), 10), task.RequestID}
+		args := []interface{}{task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID, coord, strconv.FormatInt(time.Now().UnixMilli(), 10), task.RequestID, task.TenantID, task.AgentAppID, task.Channel, task.ChannelBindingID, task.PlatformMessageID}
 		if assignment != nil {
 			args = append(args, assignment.NodeID, assignment.Revision, string(assignment.Mode), string(assignment.State), assignment.PayloadDigest)
 		}
@@ -316,7 +334,7 @@ func (s *Store) submit(ctx context.Context, task message.ExecutionTask, assignme
 		}
 		created = len(result) > 0 && asInt64(result[0]) == 1
 	} else {
-		args := []interface{}{task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID, task.RequestID}
+		args := []interface{}{task.TaskID, task.PayloadDigest, string(payload), task.Attempt, task.TraceID, inboxID, task.RequestID, strconv.FormatInt(time.Now().UnixMilli(), 10), task.TenantID, task.AgentAppID, task.Channel, task.ChannelBindingID, task.PlatformMessageID}
 		if assignment != nil {
 			args = append(args, assignment.NodeID, assignment.Revision, string(assignment.Mode), string(assignment.State), assignment.PayloadDigest)
 		}
@@ -344,6 +362,53 @@ func (s *Store) Snapshot(ctx context.Context, inboxID string) (Snapshot, error) 
 	return s.snapshotByKey(ctx, s.inboxKey(inboxID))
 }
 
+// ListSnapshots returns a bounded, newest-first view of retained inbox
+// records. It is intended for operational diagnostics; callers must not use
+// it as a source of durable business data.
+func (s *Store) ListSnapshots(ctx context.Context, limit int) ([]Snapshot, error) {
+	if err := s.ensureOpen(); err != nil {
+		return nil, err
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	var result []Snapshot
+	var cursor uint64
+	for {
+		keys, next, err := s.client.Scan(ctx, cursor, redisScanPrefix(s.inboxPrefix), 128).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, key := range keys {
+			snapshot, snapshotErr := s.snapshotByKey(ctx, key)
+			if errors.Is(snapshotErr, ErrInboxMissing) {
+				continue
+			}
+			if snapshotErr != nil {
+				return nil, snapshotErr
+			}
+			result = append(result, snapshot)
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].ReceivedAt.Equal(result[j].ReceivedAt) {
+			return result[i].TaskID > result[j].TaskID
+		}
+		return result[i].ReceivedAt.After(result[j].ReceivedAt)
+	})
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
 func (s *Store) snapshotByKey(ctx context.Context, inboxKey string) (Snapshot, error) {
 	values, err := s.client.HGetAll(ctx, inboxKey).Result()
 	if err != nil {
@@ -355,6 +420,8 @@ func (s *Store) snapshotByKey(ctx context.Context, inboxKey string) (Snapshot, e
 	snapshot := Snapshot{
 		InboxKey: inboxKey, TaskID: values["task_id"], Digest: values["digest"],
 		State: values["state"], TraceID: values["trace_id"], ErrorCode: values["error_code"], RequestID: values["request_id"],
+		TenantID: values["tenant_id"], AgentAppID: values["agent_app_id"], Channel: values["channel"],
+		BindingID: values["binding_id"], PlatformMessageID: values["platform_message_id"],
 		RawPayload: values["payload"], SessionCoord: values["session_coord"], Owner: values["owner"],
 		NodeID: values["node_id"], AssignmentState: values["assignment_state"], AssignmentMode: values["assignment_mode"],
 		AssignmentBlockedReason: values["blocked_reason"], AssignmentPayloadDigest: values["assignment_payload_digest"],
@@ -364,12 +431,33 @@ func (s *Store) snapshotByKey(ctx context.Context, inboxKey string) (Snapshot, e
 	snapshot.SessionSeq, _ = strconv.ParseInt(values["session_seq"], 10, 64)
 	snapshot.LeaseEpoch, _ = strconv.ParseInt(values["lease_epoch"], 10, 64)
 	snapshot.LeaseUntil, _ = strconv.ParseInt(values["lease_until"], 10, 64)
+	if receivedAt, err := strconv.ParseInt(values["received_at_ms"], 10, 64); err == nil && receivedAt > 0 {
+		snapshot.ReceivedAt = time.UnixMilli(receivedAt).UTC()
+	}
 	snapshot.RawEnvelope = values["persistence_envelope"]
 	snapshot.EnvelopeDigest = values["envelope_digest"]
 	snapshot.PersistAttempt, _ = strconv.Atoi(values["persist_attempt"])
 	if snapshot.RawPayload != "" {
 		var storedTask message.ExecutionTask
 		if decodeStrictJSON(snapshot.RawPayload, &storedTask) == nil {
+			if snapshot.TenantID == "" {
+				snapshot.TenantID = storedTask.TenantID
+			}
+			if snapshot.AgentAppID == "" {
+				snapshot.AgentAppID = storedTask.AgentAppID
+			}
+			if snapshot.Channel == "" {
+				snapshot.Channel = storedTask.Channel
+			}
+			if snapshot.BindingID == "" {
+				snapshot.BindingID = storedTask.ChannelBindingID
+			}
+			if snapshot.PlatformMessageID == "" {
+				snapshot.PlatformMessageID = storedTask.PlatformMessageID
+			}
+			if snapshot.ReceivedAt.IsZero() {
+				snapshot.ReceivedAt = storedTask.ReceivedAt.UTC()
+			}
 			snapshot.RequestID = storedTask.RequestID
 			snapshot.TraceParent = storedTask.TraceParent
 			snapshot.DigestVersion = storedTask.DigestVersion
@@ -386,6 +474,10 @@ func (s *Store) snapshotByKey(ctx context.Context, inboxKey string) (Snapshot, e
 		snapshot.Result = &result
 	}
 	return snapshot, nil
+}
+
+func redisScanPrefix(prefix string) string {
+	return strings.NewReplacer("\\", "\\\\", "*", "\\*", "?", "\\?", "[", "\\[").Replace(prefix) + "*"
 }
 
 func (s *Store) ReadTask(ctx context.Context, consumer string, block time.Duration) (Delivery, error) {

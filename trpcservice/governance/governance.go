@@ -509,6 +509,18 @@ func (e *PolicyEnforcer) SetAuditSink(sink AuditSink) {
 }
 
 func (e *PolicyEnforcer) AuthorizeTask(ctx context.Context, task message.ExecutionTask) error {
+	return e.authorizeTask(ctx, task, "", true)
+}
+
+// ReauthorizeTask repeats the policy check at the Worker execution boundary.
+// The Gateway owns the successful ingress audit; Worker failures use distinct
+// event types so a policy change or outage remains visible without duplicating
+// the successful authorization record.
+func (e *PolicyEnforcer) ReauthorizeTask(ctx context.Context, task message.ExecutionTask) error {
+	return e.authorizeTask(ctx, task, "worker_", false)
+}
+
+func (e *PolicyEnforcer) authorizeTask(ctx context.Context, task message.ExecutionTask, eventPrefix string, auditAllowed bool) error {
 	if e == nil || e.cache == nil {
 		return nil
 	}
@@ -517,7 +529,7 @@ func (e *PolicyEnforcer) AuthorizeTask(ctx context.Context, task message.Executi
 		if e.repository != nil {
 			_ = e.repository.SetTenantDegraded(ctx, task.TenantID, policyErrorReason(err))
 		}
-		e.emitAuthorization(ctx, task, "policy_authorization", "denied", policyErrorReason(err))
+		e.emitAuthorization(ctx, task, eventPrefix+"policy_authorization", "denied", policyErrorReason(err))
 		return err
 	}
 	decision := "allowed"
@@ -528,7 +540,9 @@ func (e *PolicyEnforcer) AuthorizeTask(ctx context.Context, task message.Executi
 	if e.repository != nil {
 		_ = e.repository.ClearTenantDegraded(ctx, task.TenantID)
 	}
-	e.emitAuthorization(ctx, task, "actor_authorization", decision, errorType(authErr))
+	if auditAllowed || authErr != nil {
+		e.emitAuthorization(ctx, task, eventPrefix+"actor_authorization", decision, errorType(authErr))
+	}
 	return authErr
 }
 

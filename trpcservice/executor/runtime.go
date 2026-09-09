@@ -237,12 +237,13 @@ func (r *Runtime) repositoryCatalogTenants() []tenant.Tenant {
 	return append([]tenant.Tenant(nil), r.catalogTenants...)
 }
 
-// AuthorizeTask is called by Worker before the Session lease is acquired.
+// AuthorizeTask is called by the assigned Worker after node admission and
+// before the Session lease is acquired.
 func (r *Runtime) AuthorizeTask(ctx context.Context, task platformmessage.ExecutionTask) error {
 	if r.policyEnforcer == nil {
 		return nil
 	}
-	return r.policyEnforcer.AuthorizeTask(ctx, task)
+	return r.policyEnforcer.ReauthorizeTask(ctx, task)
 }
 
 func (r *Runtime) policyForTask(ctx context.Context, task platformmessage.ExecutionTask) (governance.PolicySnapshot, error) {

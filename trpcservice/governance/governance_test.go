@@ -340,6 +340,45 @@ func TestPolicyEnforcerAuditsActorAndPolicyRejections(t *testing.T) {
 	}
 }
 
+func TestPolicyEnforcerWorkerRecheckAuditsOnlyFailures(t *testing.T) {
+	now := time.Now().UTC()
+	policy := control.DefaultTenantPolicy("tenant-a", nil, now)
+	repo := &fakeControlRepository{policy: policy}
+	cache, _ := NewPolicyCache(repo, time.Minute)
+	enforcer := NewPolicyEnforcer(cache, []byte("secret"), repo)
+	sink := &recordingAuditSink{}
+	enforcer.SetAuditSink(sink)
+	task := message.ExecutionTask{TaskID: "task-a", TenantID: "tenant-a", AgentAppID: "app-a", ActorUserID: "allowed", SessionID: "session-a", TraceID: "trace-a", RequestID: "request-a"}
+
+	if err := enforcer.ReauthorizeTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.records) != 0 {
+		t.Fatalf("successful worker recheck emitted audit: %#v", sink.records)
+	}
+
+	policy.ActorAllowlistHashes = []string{ActorHash([]byte("secret"), "other")}
+	policy.Revision++
+	policy.UpdatedAt = now.Add(time.Second)
+	repo.policy = policy
+	cache.Invalidate("tenant-a")
+	if err := enforcer.ReauthorizeTask(context.Background(), task); !errors.Is(err, ErrActorForbidden) {
+		t.Fatalf("worker actor recheck = %v", err)
+	}
+	if len(sink.records) != 1 || sink.records[0].EventType != "worker_actor_authorization" || sink.records[0].Decision != "denied" || sink.records[0].ErrorType != "actor_forbidden" {
+		t.Fatalf("worker actor audit = %#v", sink.records)
+	}
+
+	cache.Invalidate("tenant-a")
+	repo.err = control.ErrUnavailable
+	if err := enforcer.ReauthorizeTask(context.Background(), task); !errors.Is(err, ErrPolicyUnavailable) {
+		t.Fatalf("worker policy recheck = %v", err)
+	}
+	if len(sink.records) != 2 || sink.records[1].EventType != "worker_policy_authorization" || sink.records[1].Decision != "denied" || sink.records[1].ErrorType != "tenant_policy_unavailable" {
+		t.Fatalf("worker policy audit = %#v", sink.records)
+	}
+}
+
 func TestAuthorizeToolCallAuditsConfirmationLifecycle(t *testing.T) {
 	now := time.Now().UTC()
 	policy := control.DefaultTenantPolicy("tenant-a", nil, now)

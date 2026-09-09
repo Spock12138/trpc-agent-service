@@ -66,6 +66,7 @@ func (s *Service) Accept(ctx context.Context, inbound message.InboundMessage) (r
 			inbound.TraceID = traceID.String()
 		}
 		inbound.TraceParent = telemetry.InjectTraceParent(ctx)
+		s.reuseExistingTaskTrace(ctx, &inbound)
 	}
 	task, err := s.router.Resolve(ctx, inbound)
 	if err != nil {
@@ -330,6 +331,9 @@ func waitUntil(ctx context.Context, target time.Time) bool {
 }
 
 func (s *Service) Handle(ctx context.Context, inbound message.InboundMessage) (message.OutboundMessage, error) {
+	if s.router.TraceDigestV2Enabled() {
+		s.reuseExistingTaskTrace(ctx, &inbound)
+	}
 	task, err := s.router.Resolve(ctx, inbound)
 	if err != nil {
 		switch {
@@ -381,6 +385,34 @@ func (s *Service) Handle(ctx context.Context, inbound message.InboundMessage) (m
 		if err == nil && current.Terminal() {
 			return resultForRequest(current, inbound.RequestID)
 		}
+	}
+}
+
+func (s *Service) reuseExistingTaskTrace(ctx context.Context, inbound *message.InboundMessage) {
+	if s == nil || s.router == nil || s.store == nil || inbound == nil {
+		return
+	}
+	channel := inbound.Channel
+	if channel == "" {
+		channel = "demo"
+	}
+	messageID := inbound.PlatformMessageID
+	if messageID == "" {
+		messageID = inbound.MessageID
+	}
+	inboxID, err := s.router.InboxID(ctx, channel, inbound.BindingID, messageID)
+	if err != nil {
+		return
+	}
+	snapshot, err := s.store.Snapshot(ctx, inboxID)
+	if err != nil {
+		return
+	}
+	if snapshot.TraceID != "" {
+		inbound.TraceID = snapshot.TraceID
+	}
+	if snapshot.TraceParent != "" {
+		inbound.TraceParent = snapshot.TraceParent
 	}
 }
 

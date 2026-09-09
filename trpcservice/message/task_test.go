@@ -75,6 +75,21 @@ func TestCanonicalDigestV2RequiresTraceParent(t *testing.T) {
 	}
 }
 
+func TestBusinessDigestIgnoresTraceMetadata(t *testing.T) {
+	first := validTaskV2()
+	first.DigestVersion = 2
+	first.TraceParent = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+	second := first
+	second.TraceParent = "00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01"
+	if first.BusinessDigest() != second.BusinessDigest() {
+		t.Fatal("business digest changed with trace metadata")
+	}
+	second.Text = "changed"
+	if first.BusinessDigest() == second.BusinessDigest() {
+		t.Fatal("business digest ignored payload change")
+	}
+}
+
 func validTaskV2() ExecutionTask {
 	task := ExecutionTask{
 		SchemaVersion: TaskSchemaVersion, TaskID: "task-a", Channel: "telegram", ChannelBindingID: "binding-a", ExternalAccountID: "account-a",

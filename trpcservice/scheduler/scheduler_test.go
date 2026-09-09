@@ -127,6 +127,120 @@ func TestSchedulerSubmitAndControllerAdmission(t *testing.T) {
 	}
 }
 
+func TestSchedulerDuplicateBypassesFullNode(t *testing.T) {
+	repository, store, _ := testDependencies(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	node := testNode("node-a", 1, 0, now)
+	if err := repository.RegisterNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(repository, store, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := testTask("task-full-node", "message-full-node")
+	first, created, err := service.Submit(ctx, task)
+	if err != nil || !created {
+		t.Fatalf("first Submit() = (%#v, %t, %v)", first, created, err)
+	}
+	if err := repository.HeartbeatNode(ctx, node.NodeID, node.BootID, control.NodeReady, node.Capacity, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	duplicate := task
+	duplicate.TaskID = "task-full-node-duplicate"
+	duplicate.RequestID = "request-full-node-duplicate"
+	snapshot, created, err := service.Submit(ctx, duplicate)
+	if err != nil || created || snapshot.TaskID != first.TaskID {
+		t.Fatalf("duplicate Submit() = (%#v, %t, %v), want existing task %q", snapshot, created, err, first.TaskID)
+	}
+
+	conflict := duplicate
+	conflict.Text = "different payload"
+	conflict.PayloadDigest = conflict.CanonicalDigest()
+	if _, _, err := service.Submit(ctx, conflict); !errors.Is(err, messaging.ErrConflict) {
+		t.Fatalf("conflicting Submit() error = %v, want ErrConflict", err)
+	}
+}
+
+func TestSchedulerDuplicateAllowsTraceMetadataChange(t *testing.T) {
+	repository, store, _ := testDependencies(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := repository.RegisterNode(ctx, testNode("node-a", 4, 0, now)); err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(repository, store, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := testTask("task-trace-retry", "message-trace-retry")
+	first.DigestVersion = 2
+	first.TraceParent = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+	first.PayloadDigest = first.CanonicalDigest()
+	if _, created, err := service.Submit(ctx, first); err != nil || !created {
+		t.Fatalf("first Submit() = (created=%v, err=%v)", created, err)
+	}
+	retry := first
+	retry.TaskID = "task-trace-retry-2"
+	retry.RequestID = "request-trace-retry-2"
+	retry.TraceID = "trace-retry-2"
+	retry.TraceParent = "00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01"
+	retry.PayloadDigest = retry.CanonicalDigest()
+	snapshot, created, err := service.Submit(ctx, retry)
+	if err != nil || created || snapshot.TaskID != first.TaskID {
+		t.Fatalf("trace retry Submit() = (%#v, %t, %v)", snapshot, created, err)
+	}
+}
+
+func TestSchedulerConcurrentSubmitCreatesOneTask(t *testing.T) {
+	repository, store, _ := testDependencies(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := repository.RegisterNode(ctx, testNode("node-a", 16, 0, now)); err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(repository, store, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := testTask("task-concurrent", "message-concurrent")
+	const callers = 16
+	var wg sync.WaitGroup
+	var createdCount int
+	var mu sync.Mutex
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			snapshot, created, submitErr := service.Submit(ctx, task)
+			if submitErr != nil {
+				errs <- submitErr
+				return
+			}
+			if snapshot.TaskID != task.TaskID {
+				errs <- fmt.Errorf("snapshot task ID = %q, want %q", snapshot.TaskID, task.TaskID)
+				return
+			}
+			if created {
+				mu.Lock()
+				createdCount++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for submitErr := range errs {
+		t.Error(submitErr)
+	}
+	if createdCount != 1 {
+		t.Fatalf("created count = %d, want 1", createdCount)
+	}
+}
+
 func TestControllerMarksTenantDegradedWhenPlacementIsUnavailable(t *testing.T) {
 	repository, store, _ := testDependencies(t)
 	tracking := &degradedRepository{Repository: repository, placementErr: control.ErrUnavailable}

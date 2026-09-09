@@ -50,15 +50,51 @@ func (s *Service) Submit(ctx context.Context, task message.ExecutionTask) (messa
 	if !s.enabled {
 		return s.store.Submit(ctx, task)
 	}
+	if err := task.Validate(); err != nil {
+		return messaging.Snapshot{}, false, err
+	}
+	existing, err := s.store.Snapshot(ctx, task.InboxID())
+	if err == nil {
+		if !message.ConstantTimeDigestEqual(existing.Digest, task.PayloadDigest) {
+			storedTask, storedErr := existing.StoredTask()
+			if storedErr != nil || !message.ConstantTimeDigestEqual(storedTask.BusinessDigest(), task.BusinessDigest()) {
+				return messaging.Snapshot{}, false, messaging.ErrConflict
+			}
+		}
+		return existing, false, nil
+	}
+	if !errors.Is(err, messaging.ErrInboxMissing) {
+		return messaging.Snapshot{}, false, err
+	}
 	if err := s.repository.Ready(ctx); err != nil {
 		return messaging.Snapshot{}, false, err
 	}
-	assignment, err := s.Assign(ctx, task)
+	assignment, err := s.repository.GetAssignment(ctx, task.InboxID())
+	if err == nil {
+		if !message.ConstantTimeDigestEqual(assignment.PayloadDigest, task.PayloadDigest) {
+			stored, storedErr := s.store.Snapshot(ctx, task.InboxID())
+			if storedErr != nil {
+				return messaging.Snapshot{}, false, storedErr
+			}
+			storedTask, storedErr := stored.StoredTask()
+			if storedErr != nil || !message.ConstantTimeDigestEqual(storedTask.BusinessDigest(), task.BusinessDigest()) {
+				return messaging.Snapshot{}, false, messaging.ErrConflict
+			}
+		}
+		return s.store.SubmitAssigned(ctx, task, assignment)
+	}
+	if !errors.Is(err, control.ErrAssignmentNotFound) {
+		return messaging.Snapshot{}, false, err
+	}
+	assignment, err = s.Assign(ctx, task)
 	if err != nil {
 		return messaging.Snapshot{}, false, err
 	}
 	created, wasCreated, err := s.repository.CreateAssignment(ctx, assignment)
 	if err != nil {
+		if errors.Is(err, control.ErrAssignmentConflict) {
+			return messaging.Snapshot{}, false, messaging.ErrConflict
+		}
 		return messaging.Snapshot{}, false, err
 	}
 	if !wasCreated {

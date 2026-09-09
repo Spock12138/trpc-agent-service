@@ -125,6 +125,13 @@ func TestLeaseHeartbeatCompleteAndReply(t *testing.T) {
 	if err != nil || snapshot.State != StateSucceeded || snapshot.RequestID != task.RequestID || snapshot.RawPayload != "" || snapshot.Result == nil || snapshot.Result.Reply.Text != "ok" {
 		t.Fatalf("terminal snapshot = (%#v, %v)", snapshot, err)
 	}
+	if snapshot.TenantID != task.TenantID || snapshot.AgentAppID != task.AgentAppID || snapshot.Channel != task.Channel || snapshot.BindingID != task.ChannelBindingID || snapshot.PlatformMessageID != task.PlatformMessageID || snapshot.ReceivedAt.IsZero() {
+		t.Fatalf("terminal operational metadata = %#v", snapshot)
+	}
+	listed, err := store.ListSnapshots(context.Background(), 10)
+	if err != nil || len(listed) != 1 || listed[0].TaskID != task.TaskID {
+		t.Fatalf("ListSnapshots() = (%#v, %v)", listed, err)
+	}
 	replyDelivery, err := store.ReadReply(context.Background(), "gateway-a", time.Millisecond)
 	if err != nil || !replyDelivery.Result.Succeeded {
 		t.Fatalf("ReadReply() = (%#v, %v)", replyDelivery, err)

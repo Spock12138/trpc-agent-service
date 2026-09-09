@@ -6,6 +6,8 @@ Wait-P7Http 'http://127.0.0.1:18080/readyz' 200 90
 $bindings = if ($Mode -eq 'light') { @('demo-redis') } else { @('demo-redis','demo-postgres','demo-mysql') }
 foreach ($binding in $bindings) {
   $message=Submit-P7Message $binding "smoke $binding"
+  $duplicate=Submit-P7Message $binding "smoke $binding" -MessageID $message
+  if ($duplicate -ne $message) { throw "duplicate submit returned an unexpected message ID for $binding" }
   if ($Mode -eq 'light') {
     $deadline=(Get-Date).AddSeconds(90); do { $snapshot=Get-P7WebSnapshot $binding $message; if ($snapshot.status -in @('succeeded','failed')) { break }; Start-Sleep -Milliseconds 500 } while ((Get-Date) -lt $deadline)
     if ($snapshot.status -ne 'succeeded') { throw "light smoke failed for ${binding}: $($snapshot | ConvertTo-Json -Compress)" }

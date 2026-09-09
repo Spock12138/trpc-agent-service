@@ -93,7 +93,24 @@ func (t ExecutionTask) DeliveryTarget() DeliveryTarget {
 }
 
 func (t ExecutionTask) CanonicalDigest() string {
-	parts := []string{
+	parts := t.canonicalDigestParts()
+	if t.DigestVersion >= 2 && t.TraceParent != "" {
+		parts = append([]string{"phase6-digest-v2", t.TraceParent}, parts...)
+	}
+	return digestParts(parts...)
+}
+
+// BusinessDigest identifies the executable message payload without transport
+// trace metadata. Trace parents may legitimately differ across client retries;
+// they must not turn one platform message into a payload conflict.
+func (t ExecutionTask) BusinessDigest() string {
+	t.TraceParent = ""
+	t.DigestVersion = 0
+	return t.CanonicalDigest()
+}
+
+func (t ExecutionTask) canonicalDigestParts() []string {
+	return []string{
 		t.Channel,
 		t.ChannelBindingID,
 		t.ExternalAccountID,
@@ -110,10 +127,6 @@ func (t ExecutionTask) CanonicalDigest() string {
 		t.PlatformRequestID,
 		t.Text,
 	}
-	if t.DigestVersion >= 2 && t.TraceParent != "" {
-		parts = append([]string{"phase6-digest-v2", t.TraceParent}, parts...)
-	}
-	return digestParts(parts...)
 }
 
 func (t ExecutionTask) ValidDigest() bool {

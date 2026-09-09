@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,7 +13,27 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/control"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
+
+type AdminTask struct {
+	TaskID            string    `json:"task_id"`
+	TenantID          string    `json:"tenant_id"`
+	AgentAppID        string    `json:"agent_app_id"`
+	Channel           string    `json:"channel"`
+	BindingID         string    `json:"binding_id"`
+	PlatformMessageID string    `json:"platform_message_id"`
+	State             string    `json:"state"`
+	Attempt           int       `json:"attempt"`
+	PersistAttempt    int       `json:"persist_attempt"`
+	NodeID            string    `json:"node_id,omitempty"`
+	AssignmentState   string    `json:"assignment_state,omitempty"`
+	ErrorCode         string    `json:"error_code,omitempty"`
+	RequestID         string    `json:"request_id,omitempty"`
+	TraceID           string    `json:"trace_id,omitempty"`
+	OutboundState     string    `json:"outbound_state,omitempty"`
+	ReceivedAt        time.Time `json:"received_at"`
+}
 
 type AdminConfig struct {
 	Repository          control.Repository
@@ -21,8 +42,10 @@ type AdminConfig struct {
 		Override(context.Context, string, string) (control.NodeAssignment, error)
 	}
 	TaskLookup       func(context.Context, string, string) (map[string]any, error)
+	TaskList         func(context.Context, int) ([]AdminTask, error)
 	OutboundLookup   func(context.Context, string) (map[string]any, error)
 	ReconcilerStatus func(context.Context) (map[string]any, error)
+	Catalog          tenant.Catalog
 }
 
 func NewHandlerWithAdmin(backend Backend, admin AdminConfig) http.Handler {
@@ -38,7 +61,7 @@ func NewHandlerWithAdmin(backend Backend, admin AdminConfig) http.Handler {
 		root.HandleFunc("/api/v1/web/messages/", webSnapshotHandler(async))
 		root.Handle("/", webUIHandler())
 	}
-	root.Handle("/api/v1/admin/", adminHandlerWithLookups(admin.Repository, admin.AssignmentOverrider, control.NewAdminAuthenticator(admin.Token), admin.TaskLookup, admin.OutboundLookup, admin.ReconcilerStatus))
+	root.Handle("/api/v1/admin/", adminHandlerWithLookups(admin.Repository, admin.AssignmentOverrider, control.NewAdminAuthenticator(admin.Token), admin.TaskLookup, admin.TaskList, admin.OutboundLookup, admin.ReconcilerStatus, admin.Catalog))
 	root.Handle("/admin/", adminUIHandler())
 	return root
 }
@@ -61,21 +84,18 @@ func adminUIHandler() http.Handler {
 	})
 }
 
-const adminUIHTML = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin</title>
-<style>body{font:14px system-ui,sans-serif;max-width:960px;margin:32px auto;padding:0 16px;color:#1f2937}header{display:flex;gap:8px;align-items:center}input,button{font:inherit;padding:8px}button{cursor:pointer}table{border-collapse:collapse;width:100%;margin-top:16px}td,th{border-bottom:1px solid #ddd;padding:8px;text-align:left}pre{white-space:pre-wrap}</style></head>
-<body><header><h1>Admin</h1><input id="token" type="password" autocomplete="off" placeholder="Platform token"><button id="load">Load audit</button></header><p id="status"></p><table><thead><tr><th>Time</th><th>Tenant</th><th>Event</th><th>Decision</th><th>Error</th></tr></thead><tbody id="rows"></tbody></table>
-<script>const token=document.getElementById('token'),status=document.getElementById('status'),rows=document.getElementById('rows');document.getElementById('load').onclick=async()=>{status.textContent='';rows.textContent='';try{const r=await fetch('/api/v1/admin/audit?limit=100',{headers:{Authorization:'Bearer '+token.value}});const body=await r.json();if(!r.ok)throw new Error(body.code||'request failed');for(const item of body.items||[]){const tr=document.createElement('tr');for(const value of [item.occurred_at,item.tenant_id,item.event_type,item.decision,item.error_type]){const td=document.createElement('td');td.textContent=value||'';tr.appendChild(td)}rows.appendChild(tr)}}catch(e){status.textContent=e.message}};</script></body></html>`
+//go:embed static/admin.html
+var adminUIHTML string
 
 func adminHandler(repository control.Repository, overrider interface {
 	Override(context.Context, string, string) (control.NodeAssignment, error)
 }, authenticator control.AdminAuthenticator) http.Handler {
-	return adminHandlerWithLookups(repository, overrider, authenticator, nil, nil, nil)
+	return adminHandlerWithLookups(repository, overrider, authenticator, nil, nil, nil, nil, tenant.Catalog{})
 }
 
 func adminHandlerWithLookups(repository control.Repository, overrider interface {
 	Override(context.Context, string, string) (control.NodeAssignment, error)
-}, authenticator control.AdminAuthenticator, taskLookup func(context.Context, string, string) (map[string]any, error), outboundLookup func(context.Context, string) (map[string]any, error), reconcilerStatus func(context.Context) (map[string]any, error)) http.Handler {
+}, authenticator control.AdminAuthenticator, taskLookup func(context.Context, string, string) (map[string]any, error), taskList func(context.Context, int) ([]AdminTask, error), outboundLookup func(context.Context, string) (map[string]any, error), reconcilerStatus func(context.Context) (map[string]any, error), catalog tenant.Catalog) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := authenticator.Authenticate(r.Header.Get("Authorization")); err != nil {
 			if errors.Is(err, control.ErrAdminAPIDisabled) {
@@ -86,6 +106,23 @@ func adminHandlerWithLookups(repository control.Repository, overrider interface 
 			return
 		}
 		parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/"), "/"), "/")
+		if len(parts) == 1 && parts[0] == "catalog" && r.Method == http.MethodGet {
+			writeAdminCatalog(w, catalog)
+			return
+		}
+		if len(parts) == 1 && parts[0] == "tasks" && r.Method == http.MethodGet {
+			if taskList == nil {
+				adminUnavailable(w)
+				return
+			}
+			values, err := taskList(r.Context(), parseLimit(r.URL.Query().Get("limit")))
+			if err != nil {
+				adminUnavailable(w)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"items": values})
+			return
+		}
 		if len(parts) == 1 && parts[0] == "reconciler" && r.Method == http.MethodGet {
 			if reconcilerStatus == nil {
 				adminUnavailable(w)
@@ -167,6 +204,25 @@ func adminHandlerWithLookups(repository control.Repository, overrider interface 
 		}
 		http.NotFound(w, r)
 	})
+}
+
+func writeAdminCatalog(w http.ResponseWriter, catalog tenant.Catalog) {
+	type bindingSummary struct {
+		ID                string `json:"id"`
+		Channel           string `json:"channel"`
+		ExternalAccountID string `json:"external_account_id"`
+		TenantID          string `json:"tenant_id"`
+		AgentAppID        string `json:"agent_app_id"`
+		Enabled           bool   `json:"enabled"`
+	}
+	bindings := make([]bindingSummary, 0, len(catalog.ChannelBindings))
+	for _, binding := range catalog.ChannelBindings {
+		bindings = append(bindings, bindingSummary{
+			ID: binding.ID, Channel: binding.Channel, ExternalAccountID: binding.ExternalAccountID,
+			TenantID: binding.TenantID, AgentAppID: binding.AgentAppID, Enabled: binding.Enabled,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tenants": catalog.Tenants, "bindings": bindings})
 }
 
 func adminUnavailable(w http.ResponseWriter) {

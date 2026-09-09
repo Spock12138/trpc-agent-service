@@ -385,7 +385,7 @@ func adminHTTPConfig(cfg config.Config, repository control.Repository, overrider
 	if cfg.ControlPlane == nil || repository == nil {
 		return httpapi.AdminConfig{}
 	}
-	admin := httpapi.AdminConfig{Repository: repository, Token: cfg.ControlPlane.AdminToken, AssignmentOverrider: overrider}
+	admin := httpapi.AdminConfig{Repository: repository, Token: cfg.ControlPlane.AdminToken, AssignmentOverrider: overrider, Catalog: cfg.Catalog}
 	if store != nil {
 		admin.TaskLookup = func(ctx context.Context, bindingID, messageID string) (map[string]any, error) {
 			tenantID := ""
@@ -411,6 +411,27 @@ func adminHTTPConfig(cfg config.Config, repository control.Repository, overrider
 				return nil, err
 			}
 			return map[string]any{"task_id": taskID, "state": value.Status, "attempt": value.Attempts, "error_code": value.LastError}, nil
+		}
+		admin.TaskList = func(ctx context.Context, limit int) ([]httpapi.AdminTask, error) {
+			snapshots, err := store.ListSnapshots(ctx, limit)
+			if err != nil {
+				return nil, err
+			}
+			result := make([]httpapi.AdminTask, 0, len(snapshots))
+			for _, snapshot := range snapshots {
+				outboundState := ""
+				if value, outboundErr := store.OutboundSnapshot(ctx, snapshot.TaskID); outboundErr == nil {
+					outboundState = value.Status
+				}
+				result = append(result, httpapi.AdminTask{
+					TaskID: snapshot.TaskID, TenantID: snapshot.TenantID, AgentAppID: snapshot.AgentAppID,
+					Channel: snapshot.Channel, BindingID: snapshot.BindingID, PlatformMessageID: snapshot.PlatformMessageID, State: snapshot.State,
+					Attempt: snapshot.Attempt, PersistAttempt: snapshot.PersistAttempt, NodeID: snapshot.NodeID,
+					AssignmentState: snapshot.AssignmentState, ErrorCode: snapshot.ErrorCode,
+					RequestID: snapshot.RequestID, TraceID: snapshot.TraceID, OutboundState: outboundState, ReceivedAt: snapshot.ReceivedAt,
+				})
+			}
+			return result, nil
 		}
 	}
 	admin.ReconcilerStatus = func(ctx context.Context) (map[string]any, error) {

@@ -276,6 +276,47 @@ func TestRedisRepositoryAuditMetricsConfirmationAndLease(t *testing.T) {
 	}
 }
 
+func TestRedisRepositoryAppendAuditIsIdempotentByID(t *testing.T) {
+	repository, _ := newTestRepository(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const writers = 16
+	var group sync.WaitGroup
+	errs := make(chan error, writers)
+	for index := 0; index < writers; index++ {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			errs <- repository.AppendAudit(ctx, AuditRecord{
+				ID: "audit-replayed", TenantID: "tenant-a", EventType: "actor_authorization",
+				Decision: "allowed", Sequence: 0, OccurredAt: now.Add(time.Duration(index) * time.Millisecond),
+			})
+		}(index)
+	}
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	records, next, err := repository.QueryAudit(ctx, AuditQuery{TenantID: "tenant-a", To: now.Add(time.Second), Limit: 10})
+	if err != nil || next != "" || len(records) != 1 || records[0].ID != "audit-replayed" {
+		t.Fatalf("replayed audit query = (%#v, %q, %v)", records, next, err)
+	}
+	retained := records[0]
+	conflict := retained
+	conflict.Decision = "denied"
+	conflict.OccurredAt = now.Add(2 * time.Second)
+	if err := repository.AppendAudit(ctx, conflict); err != nil {
+		t.Fatal(err)
+	}
+	records, _, err = repository.QueryAudit(ctx, AuditQuery{TenantID: "tenant-a", To: now.Add(3 * time.Second), Limit: 10})
+	if err != nil || len(records) != 1 || records[0].Decision != retained.Decision || !records[0].OccurredAt.Equal(retained.OccurredAt) {
+		t.Fatalf("duplicate audit overwrote first record = (%#v, %v)", records, err)
+	}
+}
+
 func TestAdminAuthenticator(t *testing.T) {
 	disabled := NewAdminAuthenticator("")
 	if err := disabled.Authenticate("Bearer anything"); !errors.Is(err, ErrAdminAPIDisabled) {

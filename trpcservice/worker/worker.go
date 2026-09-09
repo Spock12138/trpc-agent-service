@@ -189,12 +189,6 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 		w.processPersistenceDelivery(runCtx, delivery)
 		return
 	}
-	if authorizer, ok := w.executor.(TaskAuthorizer); ok {
-		if authErr := authorizer.AuthorizeTask(runCtx, delivery.Task); authErr != nil {
-			_ = w.store.Reject(context.Background(), delivery, governanceErrorCode(authErr))
-			return
-		}
-	}
 	if w.controller != nil && w.controller.Enabled() {
 		admitted, admitErr := w.controller.Admit(runCtx, delivery)
 		if admitErr != nil {
@@ -205,6 +199,12 @@ func (w *Worker) process(runCtx context.Context, delivery messaging.Delivery) {
 		}
 		w.controller.SetInflight(1)
 		defer w.controller.SetInflight(0)
+	}
+	if authorizer, ok := w.executor.(TaskAuthorizer); ok {
+		if authErr := authorizer.AuthorizeTask(runCtx, delivery.Task); authErr != nil {
+			_ = w.store.Reject(context.Background(), delivery, governanceErrorCode(authErr))
+			return
+		}
 	}
 	lease, err := w.store.Begin(runCtx, delivery, w.consumer)
 	if err != nil {

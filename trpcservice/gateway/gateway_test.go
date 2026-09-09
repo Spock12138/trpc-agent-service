@@ -136,6 +136,38 @@ func TestGatewayTimeoutLeavesTaskPending(t *testing.T) {
 	}
 }
 
+func TestGatewayDigestV2RetryReusesOriginalTaskTrace(t *testing.T) {
+	service, store, cancel, done := newGatewayServiceWithDigestV2(t, time.Second, true)
+	defer func() { cancel(); _ = <-done }()
+	first := gatewayInbound("message-v2-retry", "hello", "request-first")
+	first.TraceID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	result, err := service.Accept(context.Background(), first)
+	if err != nil || result.Duplicate {
+		t.Fatalf("first Accept() = (%#v, %v)", result, err)
+	}
+	task, err := store.ReadTask(context.Background(), "worker-v2-retry", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Task.TraceParent == "" {
+		t.Fatal("first task did not receive a trace parent")
+	}
+
+	duplicate := first
+	duplicate.RequestID = "request-second"
+	duplicate.TraceID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	result, err = service.Accept(context.Background(), duplicate)
+	if err != nil || !result.Duplicate || result.TaskID != task.Task.TaskID || result.TraceID != task.Task.TraceID {
+		t.Fatalf("duplicate Accept() = (%#v, %v), want original task %q", result, err, task.Task.TaskID)
+	}
+
+	conflict := duplicate
+	conflict.Text = "different payload"
+	if _, err := service.Accept(context.Background(), conflict); !errors.Is(err, ErrMessageConflict) {
+		t.Fatalf("conflicting Accept() error = %v, want ErrMessageConflict", err)
+	}
+}
+
 func TestGatewayPolicyRejectionDoesNotSubmit(t *testing.T) {
 	service, store, cancel, done := newGatewayService(t, time.Second)
 	defer func() { cancel(); _ = <-done }()
@@ -367,6 +399,10 @@ func waitOutboundTerminal(t *testing.T, store *messaging.Store, taskID string) m
 }
 
 func newGatewayService(t *testing.T, wait time.Duration) (*Service, *messaging.Store, context.CancelFunc, <-chan error) {
+	return newGatewayServiceWithDigestV2(t, wait, false)
+}
+
+func newGatewayServiceWithDigestV2(t *testing.T, wait time.Duration, digestV2 bool) (*Service, *messaging.Store, context.CancelFunc, <-chan error) {
 	t.Helper()
 	server := miniredis.RunT(t)
 	cfg := config.MessagingConfig{
@@ -384,7 +420,7 @@ func newGatewayService(t *testing.T, wait time.Duration) (*Service, *messaging.S
 	if err != nil {
 		t.Fatal(err)
 	}
-	router, err := routing.New(repository, []byte("01234567890123456789012345678901"))
+	router, err := routing.NewWithDigestV2(repository, []byte("01234567890123456789012345678901"), digestV2)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,10 +11,13 @@ import (
 	"github.com/alicebob/miniredis/v2"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/control"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/executor"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/message"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/messaging"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 )
 
 type fakeExecutor struct {
@@ -39,6 +42,32 @@ type denyingExecutor struct {
 }
 
 func (e *denyingExecutor) AuthorizeTask(context.Context, message.ExecutionTask) error { return e.err }
+
+type trackingAuthorizerExecutor struct {
+	fakeExecutor
+	authMu      sync.Mutex
+	authCalls   int
+	authErr     error
+	onAuthorize func()
+}
+
+func (e *trackingAuthorizerExecutor) AuthorizeTask(context.Context, message.ExecutionTask) error {
+	e.authMu.Lock()
+	e.authCalls++
+	hook := e.onAuthorize
+	err := e.authErr
+	e.authMu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return err
+}
+
+func (e *trackingAuthorizerExecutor) authorizationCount() int {
+	e.authMu.Lock()
+	defer e.authMu.Unlock()
+	return e.authCalls
+}
 
 func (f *fakeExecutor) Ready(context.Context) error { return nil }
 
@@ -119,6 +148,55 @@ func TestWorkerPolicyDenialDoesNotExecuteOrAcquireSession(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestWorkerAuthorizesOnlyAfterTargetNodeAdmission(t *testing.T) {
+	t.Run("non-target worker defers without authorization", func(t *testing.T) {
+		store := newWorkerStore(t, 20*time.Millisecond, 200*time.Millisecond)
+		controller, repository := newWorkerController(t, store, "worker-other")
+		task := workerTask("node-mismatch")
+		submitAssignedTask(t, repository, store, task, "worker-target")
+		delivery, err := store.ReadTask(context.Background(), "consumer-other", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec := &trackingAuthorizerExecutor{}
+		service, err := NewWithController(store, exec, "consumer-other", controller)
+		if err != nil {
+			t.Fatal(err)
+		}
+		service.process(context.Background(), delivery)
+		snapshot, err := store.Snapshot(context.Background(), task.InboxID())
+		if err != nil || snapshot.State != "node_wait" || exec.authorizationCount() != 0 || exec.count() != 0 {
+			t.Fatalf("non-target result = (%#v, %v), authorizations=%d executions=%d", snapshot, err, exec.authorizationCount(), exec.count())
+		}
+	})
+
+	t.Run("target worker authorizes after admission", func(t *testing.T) {
+		store := newWorkerStore(t, 20*time.Millisecond, 200*time.Millisecond)
+		controller, repository := newWorkerController(t, store, "worker-target")
+		task := workerTask("target-denied")
+		submitAssignedTask(t, repository, store, task, "worker-target")
+		delivery, err := store.ReadTask(context.Background(), "consumer-target", time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		admittedBeforeAuthorization := false
+		exec := &trackingAuthorizerExecutor{authErr: governance.ErrActorForbidden}
+		exec.onAuthorize = func() {
+			snapshot, snapshotErr := store.Snapshot(context.Background(), task.InboxID())
+			admittedBeforeAuthorization = snapshotErr == nil && snapshot.AssignmentState == string(control.AssignmentAdmitted)
+		}
+		service, err := NewWithController(store, exec, "consumer-target", controller)
+		if err != nil {
+			t.Fatal(err)
+		}
+		service.process(context.Background(), delivery)
+		snapshot, err := store.Snapshot(context.Background(), task.InboxID())
+		if err != nil || snapshot.State != messaging.StateFailedTerminal || snapshot.ErrorCode != "actor_forbidden" || !admittedBeforeAuthorization || exec.authorizationCount() != 1 || exec.count() != 0 {
+			t.Fatalf("target result = (%#v, %v), admitted=%t authorizations=%d executions=%d", snapshot, err, admittedBeforeAuthorization, exec.authorizationCount(), exec.count())
+		}
+	})
 }
 
 func TestWorkerHeartbeatPreventsStaleClaimDuringExecution(t *testing.T) {
@@ -220,6 +298,60 @@ func newWorkerStore(t *testing.T, backoff, lease time.Duration) *messaging.Store
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
+}
+
+func newWorkerController(t *testing.T, store *messaging.Store, nodeID string) (*scheduler.Controller, control.Repository) {
+	t.Helper()
+	if err := store.Ready(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	server := miniredis.RunT(t)
+	cfg := config.ControlPlaneConfig{
+		RedisEndpoint: "redis://" + server.Addr(), RedisURL: "redis://" + server.Addr() + "/4", LogicalDB: 4,
+		KeyPrefix: "worker-control-" + fmt.Sprint(time.Now().UnixNano()), PolicyCacheTTL: time.Minute,
+		AuditRetention: time.Hour, MetricRetention: time.Hour, NodeHeartbeatInterval: 10 * time.Millisecond,
+		NodeOfflineAfter: 300 * time.Millisecond, NodeAssignmentWaitBackoff: 10 * time.Millisecond,
+		TraceDigestV2Enabled: true, NodeAssignmentEnabled: true, DevelopmentAllowSharedRedis: true,
+	}
+	raw, err := control.NewRedisRepository(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := control.NewInitializingRepository(raw, []tenant.Tenant{{ID: "tenant", Enabled: true}}, nil)
+	t.Cleanup(func() { _ = repository.Close() })
+	controller, err := scheduler.NewController(repository, store, &cfg, nodeID, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = controller.Close() })
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if controller.Ready(context.Background()) == nil {
+			return controller, repository
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("controller did not become ready")
+	return nil, nil
+}
+
+func submitAssignedTask(t *testing.T, repository control.Repository, store *messaging.Store, task message.ExecutionTask, nodeID string) {
+	t.Helper()
+	now := time.Now().UTC()
+	assignment := control.NodeAssignment{
+		InboxID: task.InboxID(), TenantID: task.TenantID, AgentAppID: task.AgentAppID,
+		PayloadDigest: task.PayloadDigest, NodeID: nodeID, Mode: control.PlacementShared,
+		State: control.AssignmentPlanned, Revision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if _, _, err := repository.CreateAssignment(context.Background(), assignment); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := store.SubmitAssigned(context.Background(), task, assignment); err != nil || !created {
+		t.Fatalf("SubmitAssigned = (%t, %v)", created, err)
+	}
 }
 
 func workerTask(id string) message.ExecutionTask {
